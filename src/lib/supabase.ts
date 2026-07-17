@@ -8,3 +8,4 @@ export const supabase = createClient(url, anonKey, {
 })
 
 export const AUTH_BRIDGE_URL = `${url}/functions/v1/quata-auth-bridge`
+export const QOC_ACCOUNT_URL = `${url}/functions/v1/qoc-account`

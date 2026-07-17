@@ -1,8 +1,61 @@
-import { AUTH_BRIDGE_URL, supabase } from './supabase'
+import { AUTH_BRIDGE_URL, QOC_ACCOUNT_URL, supabase } from './supabase'
 
 export type QocSession = {
-  profile: { id: string; displayName: string; avatarUrl?: string | null; isAdmin: boolean; isOfficial: boolean }
+  profile: { id: string; displayName: string; avatarUrl?: string | null; territory?: string | null; isAdmin: boolean; isOfficial: boolean }
   roles: Array<{ key: string; scopeType: string; scopeId?: string | null; permissions: string[] }>
+}
+
+export type QocAccount = {
+  displayName: string
+  neighborhood: string
+  countryCode: string
+  phoneLocal: string
+  avatarUrl?: string | null
+  secretQuestion: string
+}
+
+export type QocAccountUpdate = {
+  displayName: string
+  neighborhood: string
+  countryCode: string
+  phoneLocal: string
+  secretQuestion: string
+  secretAnswer?: string
+  newPassword?: string
+}
+
+async function invokeAccount(body: FormData | Record<string, unknown>): Promise<Record<string, unknown>> {
+  const { data } = await supabase.auth.getSession()
+  if (!data.session?.access_token) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.')
+  const response = await fetch(QOC_ACCOUNT_URL, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${data.session.access_token}`,
+      ...(body instanceof FormData ? {} : { 'content-type': 'application/json' }),
+    },
+    body: body instanceof FormData ? body : JSON.stringify(body),
+  })
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(String(payload.error || 'No se ha podido actualizar tu cuenta.'))
+  return payload
+}
+
+export async function getMyAccount(): Promise<QocAccount> {
+  const payload = await invokeAccount({ action: 'get' })
+  return payload.profile as QocAccount
+}
+
+export async function updateMyAccount(update: QocAccountUpdate): Promise<{ profile: QocAccount; passwordChanged: boolean }> {
+  const payload = await invokeAccount({ action: 'update', ...update })
+  return { profile: payload.profile as QocAccount, passwordChanged: Boolean(payload.passwordChanged) }
+}
+
+export async function uploadMyAccountAvatar(file: File): Promise<QocAccount> {
+  const form = new FormData()
+  form.set('action', 'avatar')
+  form.set('file', file)
+  const payload = await invokeAccount(form)
+  return payload.profile as QocAccount
 }
 
 export async function signInWithQuata(phone: string, countryCode: string, password: string) {
@@ -18,6 +71,26 @@ export async function signInWithQuata(phone: string, countryCode: string, passwo
   return payload
 }
 
+async function callAuthBridge(body: Record<string, string>) {
+  const response = await fetch(AUTH_BRIDGE_URL, {
+    method: 'POST',
+    headers: { apikey: import.meta.env.VITE_SUPABASE_ANON_KEY || 'sb_publishable_dQILq4zEe6xW1TpJPQwMHw_gk6ZlaX3', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) throw new Error(String(payload.error || 'No se ha podido completar la recuperación.'))
+  return payload
+}
+
+export async function getPasswordRecoveryQuestion(phone: string, countryCode: string): Promise<string> {
+  const payload = await callAuthBridge({ action: 'recovery_question', phone_local: phone.replace(/\D/g, ''), country_code: countryCode.replace(/\D/g, '') })
+  return String(payload.secret_question || '')
+}
+
+export async function resetPasswordWithSecretAnswer(phone: string, countryCode: string, secretAnswer: string, newPassword: string) {
+  await callAuthBridge({ action: 'reset_password', phone_local: phone.replace(/\D/g, ''), country_code: countryCode.replace(/\D/g, ''), secret_answer: secretAnswer, new_password: newPassword })
+}
+
 export async function signOutFromQoc() {
   // A dashboard logout is local by design: it must immediately remove the
   // browser session even if the Auth server is temporarily unreachable.
@@ -27,6 +100,7 @@ export async function signOutFromQoc() {
       if (key.startsWith('sb-') && key.endsWith('-auth-token')) storage.removeItem(key)
     }
   }
+  window.localStorage.removeItem('qoc-last-user-activity')
 }
 
 export async function getQocSession(): Promise<QocSession> {
@@ -39,6 +113,53 @@ export async function getModuleData<T = unknown>(module: string, limit = 50): Pr
   const { data, error } = await supabase.rpc('qoc_module_data', { p_module: module, p_limit: limit })
   if (error) throw error
   return data as T
+}
+
+export async function getAnalytics(scope: 'users' | 'content' | 'chat' | 'sos', days = 30): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_analytics', { p_scope: scope, p_days: days })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getMonitoring(days = 7): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_monitoring', { p_days: days })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getAuditEvents(query: string, action: string, entityType: string, page: number, pageSize = 20): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_audit_events', {
+    p_query: query || null,
+    p_action: action,
+    p_entity_type: entityType,
+    p_page: page,
+    p_page_size: pageSize,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function runMonitoringProbe(): Promise<void> {
+  const { error } = await supabase.functions.invoke('qoc-monitoring-probe', { body: {} })
+  if (error) throw error
+}
+
+export async function getGooglePlayOverview(): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.functions.invoke('qoc-google-play', { body: {} })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getComplianceOverview(): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_compliance_overview')
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getExecutiveOverview(): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_executive_overview')
+  if (error) throw error
+  return data as Record<string, unknown>
 }
 
 export async function getUserGrowthSeries(points = 13): Promise<Array<Record<string, unknown>>> {
@@ -64,6 +185,30 @@ export async function getTerritories(query: string, status: string, activity: st
     p_query: query || null,
     p_status: status,
     p_activity: activity,
+    p_page: page,
+    p_page_size: pageSize,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCommunities(query: string, status: string, activity: string, page: number, pageSize = 20): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_communities', {
+    p_query: query || null,
+    p_status: status,
+    p_activity: activity,
+    p_page: page,
+    p_page_size: pageSize,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getMediaLibrary(library: 'chat' | 'post_images' | 'post_videos', query: string, kind: string, page: number, pageSize = 24): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_media_library_v2', {
+    p_library: library,
+    p_query: query || null,
+    p_kind: kind,
     p_page: page,
     p_page_size: pageSize,
   })

@@ -1,18 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Navigate, Route, Routes, useNavigate, useParams } from 'react-router-dom'
 import { Area, AreaChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { MapContainer, Marker, TileLayer, useMap } from 'react-leaflet'
 import { divIcon } from 'leaflet'
 import {
-  Activity, Bell, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleAlert, Command, ExternalLink, Eye, FilePlus2,
+  Activity, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Command, ExternalLink, Eye, FilePlus2,
   Bold, Globe2, Heart, Image, Info, Italic, Languages, Link, List, LogOut, Map, Menu, MessageCircle, Moon, MoreHorizontal, Play, Plus, RefreshCw, Search, Share2, Sun, Trash2, Underline, Upload, Video, X, Zap,
 } from 'lucide-react'
-import { createOfficialPostVariants, decideModerationReport, deleteOfficialPostGroup, getModerationFullContent, getModerationReportDetail, getModerationReports, getModuleData, getOfficialPosts, getOfficialProfiles, getQocSession, getSosAlerts, getSosThreadMessages, getTerritories, getUserGrowthSeries, qocCommand, QocSession, signInWithQuata, signOutFromQoc, translateOfficialTexts, uploadOfficialMedia } from './lib/api'
+import { createOfficialPostVariants, decideModerationReport, deleteOfficialPostGroup, getAnalytics, getAuditEvents, getCommunities, getComplianceOverview, getExecutiveOverview, getGooglePlayOverview, getMediaLibrary, getModerationFullContent, getModerationReportDetail, getModerationReports, getModuleData, getMonitoring, getMyAccount, getOfficialPosts, getOfficialProfiles, getPasswordRecoveryQuestion, getQocSession, getSosAlerts, getSosThreadMessages, getTerritories, getUserGrowthSeries, qocCommand, QocAccount, QocSession, resetPasswordWithSecretAnswer, runMonitoringProbe, signInWithQuata, signOutFromQoc, translateOfficialTexts, updateMyAccount, uploadMyAccountAvatar, uploadOfficialMedia } from './lib/api'
 import { moduleBySlug, modules, ModuleMeta } from './lib/catalog'
 import { countryPrefixes } from './lib/country-prefixes'
 import { supabase } from './lib/supabase'
 import { RichBlockEditor } from './components/RichBlockEditor'
 import { OfficialMediaEditor } from './components/OfficialMediaEditor'
+import { AvatarImageEditor } from './components/AvatarImageEditor'
 
 type JsonRecord = Record<string, unknown>
 const formatNumber = (value: unknown) => new Intl.NumberFormat('es-ES').format(Number(value || 0))
@@ -24,6 +25,8 @@ const dateTime = (value: unknown) => {
     : 'Sin fecha'
 }
 const initials = (name?: string) => (name || 'Q').split(' ').slice(0, 2).map((word) => word[0]).join('').toUpperCase()
+const QOC_IDLE_TIMEOUT_MS = 15 * 60 * 1000
+const QOC_IDLE_ACTIVITY_KEY = 'qoc-last-user-activity'
 const isActiveSosAlert = (row: JsonRecord) => {
   const createdAt = new Date(String(row.createdAt)).getTime()
   return Number.isFinite(createdAt) && Date.now() - createdAt <= 24 * 60 * 60 * 1000
@@ -32,6 +35,7 @@ const isActiveSosAlert = (row: JsonRecord) => {
 function App() {
   const [session, setSession] = useState<QocSession | null>(null)
   const [loading, setLoading] = useState(true)
+  const endSession = useCallback(() => setSession(null), [])
 
   useEffect(() => {
     let disposed = false
@@ -63,10 +67,69 @@ function App() {
 
   if (loading) return <div className="boot"><div className="spinner" /><span>Preparando Qüata Operations Center</span></div>
   if (!session) return <Login onSession={setSession} />
-  return <Workspace session={session} onSignOut={() => setSession(null)} />
+  return <><IdleSessionGuard onExpired={endSession} /><Workspace session={session} onSignOut={endSession} onSessionChange={setSession} /></>
+}
+
+function IdleSessionGuard({ onExpired }: { onExpired: () => void }) {
+  const lastActivity = useRef(0)
+  const closing = useRef(false)
+  const refreshInFlight = useRef(false)
+
+  useEffect(() => {
+    const stored = Number(window.localStorage.getItem(QOC_IDLE_ACTIVITY_KEY))
+    lastActivity.current = Number.isFinite(stored) && stored > 0 ? stored : Date.now()
+    if (!stored) window.localStorage.setItem(QOC_IDLE_ACTIVITY_KEY, String(lastActivity.current))
+
+    const closeForInactivity = () => {
+      if (closing.current) return
+      closing.current = true
+      window.localStorage.removeItem(QOC_IDLE_ACTIVITY_KEY)
+      void signOutFromQoc().finally(onExpired)
+    }
+    const hasExpired = () => {
+      if (Date.now() - lastActivity.current < QOC_IDLE_TIMEOUT_MS) return false
+      closeForInactivity()
+      return true
+    }
+    const refreshIfNeeded = async () => {
+      if (refreshInFlight.current || closing.current) return
+      const { data } = await supabase.auth.getSession()
+      const expiresAt = Number(data.session?.expires_at || 0) * 1000
+      if (!data.session) { closeForInactivity(); return }
+      if (expiresAt - Date.now() > 2 * 60 * 1000) return
+      refreshInFlight.current = true
+      try {
+        const { data: refreshed } = await supabase.auth.refreshSession()
+        if (!refreshed.session) closeForInactivity()
+      } finally {
+        refreshInFlight.current = false
+      }
+    }
+    const registerActivity = () => {
+      if (hasExpired()) return
+      lastActivity.current = Date.now()
+      window.localStorage.setItem(QOC_IDLE_ACTIVITY_KEY, String(lastActivity.current))
+      void refreshIfNeeded()
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') registerActivity()
+    }
+    const events: Array<keyof WindowEventMap> = ['pointerdown', 'keydown', 'scroll', 'touchstart']
+    events.forEach((eventName) => window.addEventListener(eventName, registerActivity, { passive: true }))
+    document.addEventListener('visibilitychange', onVisibility)
+    const interval = window.setInterval(hasExpired, 15_000)
+    void refreshIfNeeded()
+    return () => {
+      events.forEach((eventName) => window.removeEventListener(eventName, registerActivity))
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.clearInterval(interval)
+    }
+  }, [onExpired])
+  return null
 }
 
 function Login({ onSession }: { onSession: (session: QocSession) => void }) {
+  const [recovering, setRecovering] = useState(false)
   const [countryCode, setCountryCode] = useState('240')
   const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
@@ -80,7 +143,7 @@ function Login({ onSession }: { onSession: (session: QocSession) => void }) {
   }
   return <main className="login-shell">
     <section className="login-brief">
-      <div className="brand-mark">Q</div><span className="eyebrow">QÜATA</span>
+      <div className="login-brand-lockup"><div className="brand-mark">Q</div><span className="eyebrow">QÜATA</span></div>
       <h1>Operations<br /><em>Center</em></h1>
       <p>Una visión clara para operar, proteger y comunicar en toda la plataforma.</p>
       <div className="login-status"><i /> Plataforma operativa <span>·</span> Supabase conectado</div>
@@ -94,9 +157,50 @@ function Login({ onSession }: { onSession: (session: QocSession) => void }) {
       <label>Contraseña<input value={password} type="password" onChange={(e) => setPassword(e.target.value)} required aria-label="Contraseña" /></label>
       {error && <div className="form-error"><CircleAlert size={16} />{error}</div>}
       <button className="primary full" disabled={busy}>{busy ? <><span className="button-spinner" /> Comprobando acceso...</> : 'Entrar al centro de operaciones'}</button>
+      <button type="button" className="login-recovery-link" onClick={() => setRecovering(true)}>He olvidado mi contrase&ntilde;a</button>
       <small>El acceso y las operaciones administrativas quedan registrados.</small>
     </form></section>
+    {recovering && <PasswordRecovery close={() => setRecovering(false)} />}
   </main>
+}
+
+function PasswordRecovery({ close }: { close: () => void }) {
+  const [countryCode, setCountryCode] = useState('240')
+  const [phone, setPhone] = useState('')
+  const [question, setQuestion] = useState('')
+  const [questionSelection, setQuestionSelection] = useState('')
+  const [checking, setChecking] = useState(false)
+  const [answer, setAnswer] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [notice, setNotice] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => {
+    const normalizedPhone = phone.replace(/\D/g, '')
+    setQuestion(''); setQuestionSelection(''); setNotice('')
+    if (normalizedPhone.length < 5) return
+    let active = true
+    const timeout = window.setTimeout(() => {
+      setChecking(true)
+      void getPasswordRecoveryQuestion(normalizedPhone, countryCode).then((nextQuestion) => {
+        if (active) { setQuestion(nextQuestion); setQuestionSelection(nextQuestion) }
+      }).catch(() => { if (active) setNotice('No hay ninguna cuenta con ese tel\u00e9fono o no tiene una pregunta de seguridad configurada.') }).finally(() => { if (active) setChecking(false) })
+    }, 250)
+    return () => { active = false; window.clearTimeout(timeout) }
+  }, [countryCode, phone])
+  const labels: Record<string, string> = { madre: '\u00bfC\u00f3mo se llama tu madre?', barrio: '\u00bfEn qu\u00e9 barrio creciste?', amigo: '\u00bfNombre de tu mejor amigo?', comida: '\u00bfTu comida favorita?' }
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault(); setNotice('')
+    if (!question) { setNotice('Introduce un tel\u00e9fono registrado para cargar tu pregunta de seguridad.'); return }
+    setBusy(true)
+    try { await resetPasswordWithSecretAnswer(phone, countryCode, answer, newPassword); setNotice('Tu contrase\u00f1a se ha actualizado. Ya puedes iniciar sesi\u00f3n.'); setAnswer(''); setNewPassword('') }
+    catch (cause) { setNotice(cause instanceof Error && cause.message === 'invalid_secret_answer' ? 'La respuesta secreta no es correcta.' : 'No se ha podido actualizar la contrase\u00f1a. Revisa los datos e int\u00e9ntalo de nuevo.') }
+    finally { setBusy(false) }
+  }
+  return <div className="modal-backdrop"><section className="modal recovery-modal"><header><div><h2>Recuperar contrase&ntilde;a</h2><p>Confirma tu identidad con la pregunta de seguridad de Q&uuml;ata.</p></div><button className="icon" onClick={close} title="Cerrar"><X size={18}/></button></header><form className="recovery-form" onSubmit={submit}>
+    <label>Pa&iacute;s y prefijo<CountryPrefixSelect value={countryCode} onChange={setCountryCode}/></label><label>Tel&eacute;fono<input value={phone} inputMode="tel" onChange={(event) => setPhone(event.target.value)} placeholder="Tu tel&eacute;fono registrado" required/></label>
+    <label>Tu pregunta secreta<select value={questionSelection} onChange={(event) => setQuestionSelection(event.target.value)} aria-label="Tu pregunta secreta"><option value="">{checking ? 'Cargando pregunta secreta\u2026' : 'Selecciona la pregunta configurada en tu cuenta'}</option>{Object.entries(labels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label><label>Tu respuesta secreta<input value={answer} onChange={(event) => setAnswer(event.target.value)} disabled={!question || busy} required/></label><label>Nueva contrase&ntilde;a<input type="password" value={newPassword} minLength={6} onChange={(event) => setNewPassword(event.target.value)} disabled={!question || busy} required/></label>
+    {notice && <div className={notice.includes('actualizado.') ? 'form-success' : 'form-error'}>{notice}</div>}<div className="recovery-actions"><button type="button" className="secondary" onClick={close}>Volver</button><button className="primary" disabled={!question || busy}>{busy ? 'Actualizando\u2026' : 'Actualizar contrase\u00f1a'}</button></div>
+  </form></section></div>
 }
 
 function CountryPrefixSelect({ value, onChange }: { value: string; onChange: (value: string) => void }) {
@@ -106,11 +210,79 @@ function CountryPrefixSelect({ value, onChange }: { value: string; onChange: (va
   return <div className="country-select"><button type="button" className="country-trigger" onClick={() => { setOpen((current) => !current); setQuery('') }}><Globe2 size={16}/><span>{selected.label}</span><ChevronDown size={15}/></button>{open && <div className="country-popover"><div className="country-search"><Search size={15}/><input autoFocus value={query} placeholder="Buscar país o prefijo" onChange={(event) => setQuery(event.target.value)} /></div><div className="country-results">{results.map((item) => <button type="button" key={`${item.code}-${item.label}`} className={item.code === value ? 'selected' : ''} onClick={() => { onChange(item.code); setOpen(false) }}><span>{item.label.replace(/^\+\d+\s+—\s+/, '')}</span><b>+{item.code}</b></button>)}{!results.length && <p>Sin coincidencias</p>}</div></div>}</div>
 }
 
-function Workspace({ session, onSignOut }: { session: QocSession; onSignOut: () => void }) {
+const securityQuestions = [
+  { value: 'madre', label: '¿Cuál es el nombre de tu madre?' },
+  { value: 'barrio', label: '¿En qué barrio creciste?' },
+  { value: 'amigo', label: '¿Cómo se llamaba tu mejor amigo de infancia?' },
+  { value: 'comida', label: '¿Cuál es tu comida favorita?' },
+]
+
+function AccountPanel({ session, close, onSessionChange, onSignOut }: { session: QocSession; close: () => void; onSessionChange: (session: QocSession) => void; onSignOut: () => void }) {
+  const [account, setAccount] = useState<QocAccount | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [notice, setNotice] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [pendingAvatar, setPendingAvatar] = useState<File | null>(null)
+  const [form, setForm] = useState({ displayName: '', neighborhood: '', countryCode: '240', phoneLocal: '', secretQuestion: '', secretAnswer: '', newPassword: '' })
+
+  useEffect(() => {
+    let active = true
+    void getMyAccount().then((profile) => {
+      if (!active) return
+      setAccount(profile)
+      setForm({ displayName: profile.displayName, neighborhood: profile.neighborhood, countryCode: profile.countryCode || '240', phoneLocal: profile.phoneLocal, secretQuestion: profile.secretQuestion, secretAnswer: '', newPassword: '' })
+    }).catch(() => active && setNotice('No se han podido cargar tus datos. Inténtalo de nuevo.')).finally(() => active && setLoading(false))
+    return () => { active = false }
+  }, [])
+
+  const updateSessionProfile = (profile: QocAccount) => {
+    setAccount(profile)
+    onSessionChange({ ...session, profile: { ...session.profile, displayName: profile.displayName, avatarUrl: profile.avatarUrl, territory: profile.neighborhood || session.profile.territory } })
+  }
+  const save = async (event: React.FormEvent) => {
+    event.preventDefault(); setSaving(true); setNotice('')
+    try {
+      const result = await updateMyAccount(form)
+      updateSessionProfile(result.profile)
+      setForm((current) => ({ ...current, secretAnswer: '', newPassword: '' }))
+      if (result.passwordChanged) {
+        window.alert('Tu contraseña se ha actualizado. Por seguridad, inicia sesión de nuevo.')
+        await signOutFromQoc(); onSignOut(); window.location.replace('/')
+        return
+      }
+      setNotice('Tus datos se han actualizado correctamente.')
+    } catch (cause) { setNotice(cause instanceof Error ? cause.message : 'No se han podido guardar tus datos.') }
+    finally { setSaving(false) }
+  }
+  const saveAvatar = async (file: File) => {
+    setSaving(true); setNotice('')
+    try { const profile = await uploadMyAccountAvatar(file); updateSessionProfile(profile); setPendingAvatar(null); setNotice('La imagen de perfil se ha actualizado.') }
+    catch (cause) { setNotice(cause instanceof Error ? cause.message : 'No se ha podido actualizar la imagen.') }
+    finally { setSaving(false) }
+  }
+  const pickAvatar = (event: React.ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0]; event.target.value = ''; if (file) setPendingAvatar(file) }
+  const avatar = account?.avatarUrl || session.profile.avatarUrl
+  return <><Modal title="Mi cuenta" close={close}><form className="account-panel" onSubmit={save}>
+    {loading ? <div className="account-loading"><span className="spinner"/>Cargando tus datos...</div> : <>
+      <section className="account-profile-head"><div className="account-avatar">{avatar ? <img src={avatar} alt="Imagen de perfil"/> : initials(form.displayName)}<label className="account-avatar-edit" title="Cambiar imagen"><Upload size={15}/><input type="file" accept="image/jpeg,image/png,image/webp" onChange={pickAvatar} /></label></div><div><b>{form.displayName || 'Tu perfil'}</b><small>La imagen se editará en formato 1:1 antes de guardarse.</small></div></section>
+      <div className="account-section"><h3>Mis datos</h3><div className="account-form-grid"><label>Nombre<input value={form.displayName} maxLength={80} onChange={(event) => setForm({ ...form, displayName: event.target.value })} required /></label><label>Barrio<input value={form.neighborhood} maxLength={100} onChange={(event) => setForm({ ...form, neighborhood: event.target.value })} placeholder="Tu barrio" /></label><label>País y prefijo<CountryPrefixSelect value={form.countryCode} onChange={(countryCode) => setForm({ ...form, countryCode })}/></label><label>Teléfono<input inputMode="tel" value={form.phoneLocal} onChange={(event) => setForm({ ...form, phoneLocal: event.target.value.replace(/\D/g, '') })} required /></label></div></div>
+      <div className="account-section"><h3>Seguridad</h3><div className="account-form-grid"><label>Nueva contraseña <small>Opcional</small><input type="password" value={form.newPassword} minLength={6} onChange={(event) => setForm({ ...form, newPassword: event.target.value })} placeholder="Deja este campo vacío para mantenerla" /></label><label>Pregunta de seguridad<select value={form.secretQuestion} onChange={(event) => setForm({ ...form, secretQuestion: event.target.value })}><option value="">Mantener la pregunta actual</option>{securityQuestions.map((question) => <option key={question.value} value={question.value}>{question.label}</option>)}</select></label><label className="account-full-row">Nueva respuesta de seguridad <small>Opcional</small><input type="password" value={form.secretAnswer} maxLength={160} onChange={(event) => setForm({ ...form, secretAnswer: event.target.value })} placeholder="Escribe una respuesta nueva para actualizarla" /></label></div></div>
+      {notice && <div className={notice.includes('correctamente') || notice.includes('actualizado.') ? 'form-success' : 'form-error'}>{notice}</div>}
+      <div className="account-panel-actions"><button type="button" className="secondary" onClick={close} disabled={saving}>Cancelar</button><button className="primary" disabled={saving}>{saving ? 'Guardando...' : 'Guardar cambios'}</button></div>
+    </>}
+  </form></Modal>{pendingAvatar && <AvatarImageEditor file={pendingAvatar} onCancel={() => setPendingAvatar(null)} onSave={saveAvatar}/>}</>
+}
+
+function Workspace({ session, onSignOut, onSessionChange }: { session: QocSession; onSignOut: () => void; onSessionChange: (session: QocSession) => void }) {
+  const navigate = useNavigate()
+  const editorialOnly = session.profile.isOfficial && !session.profile.isAdmin && session.roles.length === 0
+  const visibleModules = editorialOnly ? modules.filter((item) => item.slug === 'editor-oficial') : modules
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [dark, setDark] = useState(() => localStorage.getItem('qoc-theme') === 'dark')
   const [searchOpen, setSearchOpen] = useState(false)
+  const [accountOpen, setAccountOpen] = useState(false)
   const [sosActiveCount, setSosActiveCount] = useState(0)
+  const [realtimeStatus, setRealtimeStatus] = useState<'operational' | 'attention' | 'unknown'>('unknown')
   useEffect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; localStorage.setItem('qoc-theme', dark ? 'dark' : 'light') }, [dark])
   useEffect(() => {
     let active = true
@@ -119,68 +291,166 @@ function Workspace({ session, onSignOut }: { session: QocSession; onSignOut: () 
     const interval = window.setInterval(refreshSosCount, 30_000)
     return () => { active = false; window.clearInterval(interval) }
   }, [])
+  useEffect(() => {
+    let active = true
+    const refreshRealtime = () => { void getMonitoring().then((snapshot) => {
+      if (!active) return
+      const services = Array.isArray(snapshot.services) ? snapshot.services as JsonRecord[] : []
+      const realtime = services.find((service) => String(service.key) === 'realtime')
+      setRealtimeStatus(realtime && ['operational', 'attention', 'unknown'].includes(String(realtime.status)) ? String(realtime.status) as 'operational' | 'attention' | 'unknown' : 'unknown')
+    }).catch(() => { if (active) setRealtimeStatus('unknown') }) }
+    refreshRealtime()
+    const interval = window.setInterval(refreshRealtime, 60_000)
+    return () => { active = false; window.clearInterval(interval) }
+  }, [])
   return <div className="app-shell">
     <aside className={`sidebar ${sidebarOpen ? 'open' : ''}`}>
       <div className="sidebar-brand"><div className="brand-mark compact">Q</div><div><strong>Qüata</strong><small>Operations Center</small></div><button className="icon mobile-only" onClick={() => setSidebarOpen(false)}><X size={18} /></button></div>
-      <nav>{['Operaciones', 'Contenido', 'Comunicación', 'Analítica', 'Plataforma'].map((group) => <NavGroup key={group} group={group} close={() => setSidebarOpen(false)} sosActiveCount={sosActiveCount} />)}</nav>
-      <div className="sidebar-foot"><div className="realtime-dot" /><span>Realtime disponible</span></div>
+      <nav>{['Operaciones', 'Contenido', 'Comunicación', 'Analítica', 'Plataforma'].filter((group) => visibleModules.some((item) => item.group === group)).map((group) => <NavGroup key={group} group={group} items={visibleModules} close={() => setSidebarOpen(false)} sosActiveCount={sosActiveCount} />)}</nav>
+      <button className={`sidebar-foot realtime-status ${realtimeStatus}`} onClick={() => navigate('/monitorizacion')} title="Abrir monitorización"><div className="realtime-dot" /><span>{realtimeStatus === 'operational' ? 'Realtime operativo' : realtimeStatus === 'attention' ? 'Realtime requiere revisión' : 'Realtime sin sonda reciente'}</span></button>
     </aside>
     <main className="main-shell">
       <header className="topbar">
         <button className="icon mobile-only" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button>
-        <button className="context-switch"><span className="avatar small">{initials(session.profile.displayName)}</span><span><b>{session.profile.displayName}</b><small>{session.roles[0]?.key?.replaceAll('_', ' ') || 'Operador'}</small></span><ChevronsUpDown size={16} /></button>
-        <div className="topbar-actions"><button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={16} /><span>Buscar</span><kbd>⌘ K</kbd></button><button className="icon" onClick={() => setDark(!dark)} title="Cambiar tema">{dark ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon notice"><Bell size={18} /><i /></button><button className="icon" onClick={() => { void (async () => { await signOutFromQoc(); onSignOut(); window.location.replace('/') })() }} title="Cerrar sesión"><LogOut size={18} /></button></div>
+        <button className="context-switch" onClick={() => setAccountOpen(true)} title="Gestionar mi cuenta"><span className="avatar small">{session.profile.avatarUrl ? <img src={session.profile.avatarUrl} alt=""/> : initials(session.profile.displayName)}</span><span><b>{session.profile.displayName}</b><small>{editorialOnly ? 'Cuenta oficial' : session.roles[0]?.key?.replaceAll('_', ' ') || 'Operador'}</small></span><ChevronDown size={15}/></button>
+        <div className="topbar-actions"><button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={16} /><span>Buscar</span><kbd>⌘ K</kbd></button><button className="icon" onClick={() => setDark(!dark)} title="Cambiar tema">{dark ? <Sun size={18} /> : <Moon size={18} />}</button><button className="icon" onClick={() => { void (async () => { await signOutFromQoc(); onSignOut(); window.location.replace('/') })() }} title="Cerrar sesión"><LogOut size={18} /></button></div>
       </header>
-      <Routes><Route path="/" element={<Navigate to="/dashboard" replace />} /><Route path="/:slug" element={<ModulePage session={session} />} /></Routes>
+      <Routes><Route path="/" element={<Navigate to={editorialOnly ? '/editor-oficial' : '/dashboard'} replace />} /><Route path="/:slug" element={<ModulePage session={session} editorialOnly={editorialOnly} />} /></Routes>
     </main>
     {sidebarOpen && <div className="scrim" onClick={() => setSidebarOpen(false)} />}
-    {searchOpen && <CommandPalette close={() => setSearchOpen(false)} />}
+    {searchOpen && <CommandPalette close={() => setSearchOpen(false)} items={visibleModules} />}
+    {accountOpen && <AccountPanel session={session} close={() => setAccountOpen(false)} onSessionChange={onSessionChange} onSignOut={onSignOut}/>} 
   </div>
 }
 
-function NavGroup({ group, close, sosActiveCount }: { group: string; close: () => void; sosActiveCount: number }) {
-  const navigate = useNavigate(); const location = locationPath(); const groupModules = modules.filter((item) => item.group === group)
+function NavGroup({ group, items, close, sosActiveCount }: { group: string; items: ModuleMeta[]; close: () => void; sosActiveCount: number }) {
+  const navigate = useNavigate(); const location = locationPath(); const groupModules = items.filter((item) => item.group === group)
   return <section className="nav-group"><p>{group}</p>{groupModules.map((item) => { const Icon = item.icon; const active = location === `/${item.slug}`; return <button key={item.slug} className={active ? 'nav-link active' : 'nav-link'} onClick={() => { navigate(`/${item.slug}`); close() }}><Icon size={17} /><span>{item.label}</span>{item.slug === 'sos' && sosActiveCount > 0 && <b className="nav-count">{sosActiveCount}</b>}</button> })}</section>
 }
 
 function locationPath() { return window.location.pathname }
 
-function CommandPalette({ close }: { close: () => void }) {
-  const navigate = useNavigate(); const [term, setTerm] = useState(''); const results = modules.filter((item) => `${item.label} ${item.description}`.toLowerCase().includes(term.toLowerCase()))
+function CommandPalette({ close, items }: { close: () => void; items: ModuleMeta[] }) {
+  const navigate = useNavigate(); const [term, setTerm] = useState(''); const results = items.filter((item) => `${item.label} ${item.description}`.toLowerCase().includes(term.toLowerCase()))
   return <div className="command-backdrop" onMouseDown={close}><section className="command-panel" onMouseDown={(event) => event.stopPropagation()}><div><Search size={18}/><input autoFocus placeholder="Buscar módulo, usuario o acción..." value={term} onChange={(e) => setTerm(e.target.value)} /><kbd>ESC</kbd></div><p>Ir a</p>{results.slice(0, 8).map((item) => { const Icon = item.icon; return <button key={item.slug} onClick={() => { navigate(`/${item.slug}`); close() }}><Icon size={17}/><span>{item.label}</span><small>{item.group}</small></button> })}</section></div>
 }
 
-function ModulePage({ session }: { session: QocSession }) {
+function ModulePage({ session, editorialOnly }: { session: QocSession; editorialOnly: boolean }) {
   const { slug } = useParams(); const meta = moduleBySlug(slug); const [data, setData] = useState<unknown>(null); const [state, setState] = useState<'loading'|'ready'|'error'>('loading'); const [refresh, setRefresh] = useState(0)
-  useEffect(() => { let alive = true; setState('loading'); if (!meta.dataKey) { setData(null); setState('ready'); return } getModuleData(meta.dataKey).then((value) => { if (alive) { setData(value); setState('ready') } }).catch(() => alive && setState('error')); return () => { alive = false } }, [meta.slug, meta.dataKey, refresh])
+  useEffect(() => { let alive = true; setState('loading'); if (!meta.dataKey || (editorialOnly && meta.slug === 'editor-oficial')) { setData(null); setState('ready'); return } getModuleData(meta.dataKey).then((value) => { if (alive) { setData(value); setState('ready') } }).catch(() => alive && setState('error')); return () => { alive = false } }, [meta.slug, meta.dataKey, refresh, editorialOnly])
   const Icon = meta.icon
+  if (editorialOnly && meta.slug !== 'editor-oficial') return <Navigate to="/editor-oficial" replace />
   return <section className="page"><div className="page-head"><div><div className="crumb">Qüata Operations Center <span>/</span> {meta.group}</div><h1><Icon size={27}/>{meta.label}</h1><p>{meta.description}</p></div><div className="page-actions"><button className="secondary" onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={16}/>Actualizar</button>{primaryAction(meta.slug)}</div></div>
-    {state === 'loading' && <SkeletonPage />}{state === 'error' && <ErrorPanel retry={() => setRefresh((value) => value + 1)} />}{state === 'ready' && <ModuleContent meta={meta} data={data} session={session} refresh={() => setRefresh((value) => value + 1)} />}
+    {state === 'loading' && <SkeletonPage />}{state === 'error' && <ErrorPanel retry={() => setRefresh((value) => value + 1)} />}{state === 'ready' && <ModuleContent meta={meta} data={data} session={session} refresh={() => setRefresh((value) => value + 1)} refreshKey={refresh} />}
   </section>
 }
 
 function primaryAction(slug: string) {
   if (slug === 'editor-oficial') return <button className="primary" onClick={() => window.dispatchEvent(new Event('qoc:new-official-post'))}><FilePlus2 size={16}/>Nueva publicación</button>
-  if (slug === 'campanas') return <button className="primary"><Plus size={16}/>Nueva campaña</button>
   return null
 }
 const SirenIcon = () => <Zap size={16}/>
 
-function ModuleContent({ meta, data, session, refresh }: { meta: ModuleMeta; data: unknown; session: QocSession; refresh: () => void }) {
-  if (meta.slug === 'dashboard') return <ExecutiveDashboard data={data as JsonRecord} />
+function ModuleContent({ meta, data, session, refresh, refreshKey }: { meta: ModuleMeta; data: unknown; session: QocSession; refresh: () => void; refreshKey: number }) {
+  if (meta.slug === 'dashboard') return <ExecutiveOverview refreshKey={refreshKey} />
   if (meta.slug === 'sos') return <SosModule data={data as JsonRecord[]} mapOnly={false} />
-  if (meta.slug === 'territorios') return <TerritoriesModule />
+  if (meta.slug === 'territorios') return <CommunitiesModule />
   if (meta.slug === 'moderacion') return <Moderation data={data as JsonRecord[]} refresh={refresh} />
-  if (meta.slug === 'oficiales' || meta.slug === 'editor-oficial') return <OfficialModule data={data as JsonRecord} editor={meta.slug === 'editor-oficial'} refresh={refresh} />
-  if (meta.slug === 'usuarios') return <UsersModule data={data as JsonRecord[]} refresh={refresh} />
-  if (meta.slug === 'campanas') return <CampaignModule data={data as JsonRecord[]} refresh={refresh} />
+  if (meta.slug === 'usuarios' || meta.slug === 'editor-oficial') return <OfficialModule data={data as JsonRecord} editor={meta.slug === 'editor-oficial'} refresh={refresh} session={session} />
+  if (meta.slug === 'biblioteca') return <MediaLibraryModule />
+  if (meta.slug === 'monitorizacion') return <MonitoringModule refreshKey={refreshKey} />
   if (meta.slug === 'soporte') return <SupportModule data={data as JsonRecord[]} refresh={refresh} />
-  if (meta.slug.startsWith('analitica')) return <AnalyticsModule data={data as JsonRecord} title={meta.label} />
-  if (meta.slug === 'roadmap' || meta.slug === 'automatizacion') return <Roadmap />
-  if (meta.slug === 'configuracion' || meta.slug === 'versiones' || meta.slug === 'cumplimiento') return <PlatformModule data={data as JsonRecord} mode={meta.slug} />
-  if (meta.slug === 'traduccion') return <TranslationsModule data={data as JsonRecord[]} refresh={refresh} />
-  if (meta.slug === 'auditoria') return <AuditModule data={data as JsonRecord[]} />
+  if (meta.slug.startsWith('analitica')) {
+    const analyticsScope = ({ 'analitica-usuarios': 'users', 'analitica-contenido': 'content', 'analitica-chat': 'chat', 'analitica-sos': 'sos' } as const)[meta.slug] || 'users'
+    return <AnalyticsModule scope={analyticsScope} title={meta.label} refreshSignal={refresh} />
+  }
+  if (meta.slug === 'versiones') return <PlatformModule data={data as JsonRecord} mode="versiones" refreshKey={refreshKey} />
+  if (meta.slug === 'cumplimiento') return <ComplianceModule refreshKey={refreshKey} />
+  if (meta.slug === 'auditoria') return <AuditModule refreshSignal={refresh} />
   return <CollectionModule meta={meta} data={data} session={session} />
+}
+
+function ExecutiveOverview({ refreshKey }: { refreshKey: number }) {
+  const navigate = useNavigate()
+  const [overview, setOverview] = useState<JsonRecord | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError('')
+    getExecutiveOverview().then((value) => { if (active) setOverview(value) }).catch(() => {
+      if (active) setError('No se ha podido cargar el resumen operativo.')
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [refreshKey])
+
+  if (loading) return <div className="territory-loading"><span className="spinner"/>Preparando la situación operativa…</div>
+  if (error || !overview) return <div className="territory-error"><CircleAlert size={18}/><span>{error || 'No hay información operativa disponible.'}</span></div>
+
+  const sos = (overview.sos || {}) as JsonRecord
+  const moderation = (overview.moderation || {}) as JsonRecord
+  const users = (overview.users || {}) as JsonRecord
+  const territories = (overview.territories || {}) as JsonRecord
+  const content = (overview.content || {}) as JsonRecord
+  const chat = (overview.chat || {}) as JsonRecord
+  const security = (overview.security || {}) as JsonRecord
+  const version = (overview.version || {}) as JsonRecord
+  const services = (overview.services || []) as JsonRecord[]
+  const activity = (overview.activity || []) as JsonRecord[]
+  const growth = (overview.growthSeries || []) as JsonRecord[]
+  const activeSos = Number(sos.active24h || 0)
+  const openModeration = Number(moderation.open || 0)
+  const rlsExceptions = Number(security.disabledTables || 0)
+  const serviceAttention = services.filter((service) => String(service.status) === 'attention').length
+  const coverage = Number(security.totalTables || 0) ? Math.round((Number(security.enabledTables || 0) / Number(security.totalTables || 1)) * 100) : 0
+  const urgent = activeSos + openModeration + serviceAttention + rlsExceptions
+  const relative = (value: unknown) => {
+    const millis = Date.now() - new Date(String(value || '')).getTime()
+    if (!Number.isFinite(millis)) return 'Sin actividad reciente'
+    const minutes = Math.max(0, Math.floor(millis / 60000))
+    if (minutes < 1) return 'Ahora mismo'
+    if (minutes < 60) return `Hace ${minutes} min`
+    const hours = Math.floor(minutes / 60)
+    if (hours < 24) return `Hace ${hours} h`
+    return `Hace ${Math.floor(hours / 24)} d`
+  }
+  const priorityItems = [
+    activeSos > 0 ? { key: 'sos', title: `${activeSos} alerta${activeSos === 1 ? '' : 's'} SOS activa${activeSos === 1 ? '' : 's'}`, detail: `Última: ${relative((sos.latest as JsonRecord)?.createdAt)}`, path: '/sos', tone: 'critical' } : null,
+    openModeration > 0 ? { key: 'moderation', title: `${openModeration} caso${openModeration === 1 ? '' : 's'} pendiente${openModeration === 1 ? '' : 's'} de moderación`, detail: `Último reporte: ${relative((moderation.latest as JsonRecord)?.createdAt)}`, path: '/moderacion', tone: 'warning' } : null,
+    serviceAttention > 0 ? { key: 'services', title: `${serviceAttention} servicio${serviceAttention === 1 ? '' : 's'} requiere revisión`, detail: 'Consulta el estado técnico y las dependencias.', path: '/monitorizacion', tone: 'warning' } : null,
+    rlsExceptions > 0 ? { key: 'security', title: `${rlsExceptions} excepción${rlsExceptions === 1 ? '' : 'es'} RLS pendiente${rlsExceptions === 1 ? '' : 's'}`, detail: 'No se aplican cambios automáticos de permisos.', path: '/cumplimiento', tone: 'info' } : null,
+  ].filter(Boolean) as Array<{ key: string; title: string; detail: string; path: string; tone: string }>
+
+  return <>
+    <section className={`executive-hero ${urgent ? 'has-attention' : ''}`}>
+      <div><span className="executive-kicker"><span className={urgent ? 'pulse attention' : 'pulse'}/>{urgent ? 'Atención operativa requerida' : 'Situación operativa estable'}</span><h2>{urgent ? `${urgent} señal${urgent === 1 ? '' : 'es'} para revisar` : 'La plataforma opera con normalidad'}</h2><p>{activeSos ? 'Hay alertas SOS recientes que requieren seguimiento desde el centro de control.' : 'No hay alertas SOS activas en este momento. La actividad y las integraciones se actualizan desde sus fuentes operativas.'}</p><div className="executive-hero-actions"><button className="primary" onClick={() => navigate(activeSos ? '/sos' : '/monitorizacion')}>{activeSos ? 'Abrir Centro SOS' : 'Ver monitorización'}<ExternalLink size={15}/></button><button className="secondary" onClick={() => navigate('/auditoria')}>Ver auditoría</button></div></div>
+      <div className="executive-status-orbit"><span>{formatNumber(users.active30d)}</span><small>usuarios activos<br/>en 30 días</small><i/></div>
+    </section>
+    <section className="executive-kpi-grid">
+      <button className="executive-kpi-card" onClick={() => navigate('/usuarios')}><span>Usuarios</span><b>{formatNumber(users.total)}</b><small>+{formatNumber(users.new30d)} altas en 30 días</small></button>
+      <button className={`executive-kpi-card ${activeSos ? 'critical' : ''}`} onClick={() => navigate('/sos')}><span>Centro SOS</span><b>{formatNumber(activeSos)}</b><small>{formatNumber(sos.withLocation30d)} alertas geolocalizadas en 30 días</small></button>
+      <button className={`executive-kpi-card ${openModeration ? 'warning' : ''}`} onClick={() => navigate('/moderacion')}><span>Moderación</span><b>{formatNumber(openModeration)}</b><small>casos pendientes o en revisión</small></button>
+      <button className="executive-kpi-card" onClick={() => navigate('/editor-oficial')}><span>Publicaciones oficiales</span><b>{formatNumber(content.officialPosts)}</b><small>{formatNumber(content.officialPosts30d)} creadas en 30 días</small></button>
+    </section>
+    <section className="executive-grid">
+      <Panel title="Prioridades operativas" action={<button className="panel-action" onClick={() => navigate('/moderacion')}>Ver cola <ExternalLink size={14}/></button>}>
+        <div className="executive-priorities">{priorityItems.length ? priorityItems.map((item) => <button key={item.key} className={`executive-priority ${item.tone}`} onClick={() => navigate(item.path)}><span className="severity"/><div><b>{item.title}</b><small>{item.detail}</small></div><ChevronRight size={17}/></button>) : <div className="executive-clear"><Activity size={20}/><div><b>Sin prioridades abiertas</b><span>No hay SOS, incidencias técnicas ni casos de moderación pendientes.</span></div></div>}</div>
+      </Panel>
+      <Panel title="Pulso de plataforma" action={<button className="panel-action" onClick={() => navigate('/monitorizacion')}>Ver monitorización <ExternalLink size={14}/></button>}>
+        <div className="executive-services">{services.map((service) => <button key={String(service.key)} onClick={() => navigate('/monitorizacion')}><span className={`status ${String(service.status || 'unknown')}`}/><b>{String(service.name)}</b><small>{String(service.status) === 'operational' ? 'Operativo' : String(service.status) === 'attention' ? 'Revisar' : 'Sin sonda reciente'}</small></button>)}</div>
+      </Panel>
+      <Panel title="Crecimiento de usuarios" action={<button className="panel-action" onClick={() => navigate('/analitica-usuarios')}>Analítica <ExternalLink size={14}/></button>}><UserGrowthChart data={growth}/></Panel>
+      <Panel title="Actividad administrativa" action={<button className="panel-action" onClick={() => navigate('/auditoria')}>Ver auditoría <ExternalLink size={14}/></button>}>
+        <div className="executive-activity">{activity.length ? activity.map((item) => <button key={String(item.id)} onClick={() => navigate('/auditoria')}><span className="activity-mark"/><div><b>{auditActionLabel(String(item.action || ''))}</b><small>{String(item.actor || 'Sistema')} · {relative(item.createdAt)}</small></div><ChevronRight size={15}/></button>) : <div className="no-activity">Sin actividad administrativa registrada.</div>}</div>
+      </Panel>
+      <Panel title="Comunidad y conversación" action={<button className="panel-action" onClick={() => navigate('/territorios')}>Gestión territorial <ExternalLink size={14}/></button>}>
+        <div className="executive-two-column"><div><span>Comunidades</span><b>{formatNumber(territories.communities)}</b><small>{formatNumber(territories.memberships)} participaciones</small></div><div><span>Mensajes en 24 h</span><b>{formatNumber(chat.messages24h)}</b><small>{formatNumber(chat.pendingDelivery15m)} pendientes de entrega</small></div><div><span>Adjuntos en 30 d</span><b>{formatNumber(chat.attachments30d)}</b><small>Biblioteca multimedia</small></div><div><span>Publicaciones feed</span><b>{formatNumber(content.feedPosts30d)}</b><small>Últimos 30 días</small></div></div>
+      </Panel>
+      <Panel title="Versión y seguridad" action={<button className="panel-action" onClick={() => navigate('/versiones')}>Versiones <ExternalLink size={14}/></button>}>
+        <div className="executive-release"><div><span>Producción Android</span><b>{String(version.version || 'Sin sincronizar')}</b><small>version code {String(version.versionCode || '—')} · {relative(version.cachedAt)}</small></div><button className={`executive-security ${rlsExceptions ? 'attention' : ''}`} onClick={() => navigate('/cumplimiento')}><span>{coverage}%</span><small>cobertura RLS</small><b>{rlsExceptions ? `${rlsExceptions} excepción${rlsExceptions === 1 ? '' : 'es'}` : 'Sin excepciones'}</b></button></div>
+      </Panel>
+    </section>
+  </>
 }
 
 function ExecutiveDashboardLegacy({ data }: { data: JsonRecord }) {
@@ -194,20 +464,15 @@ function ExecutiveDashboard({ data }: { data: JsonRecord }) {
   const activity = (data.activity || []) as JsonRecord[]
   const services = (data.services || []) as JsonRecord[]
   const [analytics, setAnalytics] = useState<JsonRecord | null>(null)
-  const [translationJobs, setTranslationJobs] = useState<JsonRecord[]>([])
   const [activityOpen, setActivityOpen] = useState(false)
   const [serviceInfo, setServiceInfo] = useState<JsonRecord | null>(null)
 
   useEffect(() => {
     let active = true
-    Promise.all([
-      getUserGrowthSeries().catch(async () => (await getModuleData<JsonRecord>('analytics')).series as JsonRecord[]),
-      getModuleData<JsonRecord[]>('translations'),
-    ])
-      .then(([series, translations]) => {
+    getUserGrowthSeries().catch(async () => (await getModuleData<JsonRecord>('analytics')).series as JsonRecord[])
+      .then((series) => {
         if (!active) return
         setAnalytics({ series })
-        setTranslationJobs(translations)
       })
       .catch(() => undefined)
     return () => { active = false }
@@ -215,13 +480,6 @@ function ExecutiveDashboard({ data }: { data: JsonRecord }) {
 
   const serviceState = (service: JsonRecord) => {
     const name = String(service.name)
-    if (name === 'Traducción') {
-      const failed = translationJobs.filter((job) => job.status === 'failed').length
-      const waiting = translationJobs.filter((job) => ['pending', 'translating', 'review'].includes(String(job.status))).length
-      if (failed) return { status: 'degraded', label: 'Requiere revisión', detail: `${failed} trabajo${failed === 1 ? '' : 's'} de traducción ha${failed === 1 ? '' : 'n'} fallado. Abre el Centro de traducción para revisar la cola.`, target: '/traduccion' }
-      if (waiting) return { status: 'operational', label: `${waiting} en cola`, detail: `Hay ${waiting} trabajo${waiting === 1 ? '' : 's'} de traducción en curso o pendiente${waiting === 1 ? '' : 's'}, sin errores registrados.`, target: '/traduccion' }
-      return { status: 'operational', label: 'Sin incidencias', detail: 'No hay trabajos de traducción pendientes ni fallidos. Este estado representa la cola del QOC; la disponibilidad del proveedor se mostrará cuando incorporemos una sonda específica.', target: '/traduccion' }
-    }
     const descriptions: Record<string, string> = {
       Supabase: 'La sesión actual ha podido consultar los datos operativos de Supabase correctamente.',
       Realtime: 'Los canales de tiempo real están disponibles para las funciones activas de la plataforma.',
@@ -237,10 +495,10 @@ function ExecutiveDashboard({ data }: { data: JsonRecord }) {
       <Panel title="Actividad reciente" action={<button className="panel-action" onClick={() => setActivityOpen(true)}>Ver toda <ExternalLink size={14}/></button>}><Timeline rows={activity}/></Panel>
       <Panel title="Estado de servicios"><div className="services">{services.map((item) => { const state = serviceState(item); return <div key={String(item.name)}><span className={`status ${state.status}`}/><b>{String(item.name)}</b><small className={state.status === 'degraded' ? 'attention' : ''}>{state.label}</small><button className="service-info" onClick={() => setServiceInfo({ name: item.name, ...state })} title={`Información sobre ${String(item.name)}`}><Info size={15}/></button></div> })}</div></Panel>
       <Panel title="Evolución de usuarios"><UserGrowthChart data={(analytics?.series || []) as JsonRecord[]}/></Panel>
-      <Panel title="Pendientes prioritarios"><div className="tasks"><button onClick={() => navigate('/moderacion')}><span className="severity warning"/>Revisar cola de moderación <b>→</b></button><button onClick={() => navigate('/campanas')}><span className="severity info"/>Validar campañas programadas <b>→</b></button><button onClick={() => navigate('/editor-oficial')}><span className="severity success"/>Preparar comunicación oficial <b>→</b></button></div></Panel>
+      <Panel title="Pendientes prioritarios"><div className="tasks"><button onClick={() => navigate('/moderacion')}><span className="severity warning"/>Revisar cola de moderación <b>→</b></button><button onClick={() => navigate('/editor-oficial')}><span className="severity success"/>Preparar comunicación oficial <b>→</b></button></div></Panel>
     </div>
     {activityOpen && <Modal title="Actividad reciente" close={() => setActivityOpen(false)}><Timeline rows={activity}/></Modal>}
-    {serviceInfo && <Modal title={`Estado de ${String(serviceInfo.name)}`} close={() => setServiceInfo(null)}><div className="service-modal"><span className={`status ${String(serviceInfo.status)}`}/><div><b>{String(serviceInfo.label)}</b><p>{String(serviceInfo.detail)}</p>{Boolean(serviceInfo.target) && <button className="primary" onClick={() => { navigate(String(serviceInfo.target)); setServiceInfo(null) }}>Abrir Centro de traducción</button>}</div></div></Modal>}
+    {serviceInfo && <Modal title={`Estado de ${String(serviceInfo.name)}`} close={() => setServiceInfo(null)}><div className="service-modal"><span className={`status ${String(serviceInfo.status)}`}/><div><b>{String(serviceInfo.label)}</b><p>{String(serviceInfo.detail)}</p></div></div></Modal>}
   </>
 }
 
@@ -332,9 +590,9 @@ function sosDistanceKm(a: { latitude: number; longitude: number }, b: { latitude
   return 6371 * 2 * Math.atan2(Math.sqrt(factor), Math.sqrt(1 - factor))
 }
 
-function clusterSosAlerts(alerts: JsonRecord[]): SosCluster[] {
+function clusterSosAlerts(alerts: unknown): SosCluster[] {
   const clusters: SosCluster[] = []
-  for (const alert of alerts) {
+  for (const alert of (Array.isArray(alerts) ? alerts : [])) {
     const point = sosCoordinates(alert)
     if (!point) continue
     const nearby = clusters.find((cluster) => sosDistanceKm(cluster, point) <= 1.2)
@@ -378,21 +636,21 @@ function SosOperationalMap({ clusters, focusedCluster, selectedClusterId, onSele
 }
 
 function SosModule({ data, mapOnly }: { data: JsonRecord[]; mapOnly: boolean }) {
-  const [alerts, setAlerts] = useState<JsonRecord[]>(data || [])
+  const [alerts, setAlerts] = useState<JsonRecord[]>(() => Array.isArray(data) ? data : [])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [groupOverviewId, setGroupOverviewId] = useState<string | null>(null)
   const [threadAlert, setThreadAlert] = useState<JsonRecord | null>(null)
   const [threadMessages, setThreadMessages] = useState<JsonRecord[]>([])
   const [threadLoading, setThreadLoading] = useState(false)
   const [threadError, setThreadError] = useState('')
-  const rows = alerts
+  const rows = Array.isArray(alerts) ? alerts : []
   const clusters = useMemo(() => clusterSosAlerts(rows), [rows])
 
   useEffect(() => {
     let active = true
     getSosAlerts().then((nextAlerts) => {
       if (!active) return
-      setAlerts(nextAlerts as JsonRecord[])
+      setAlerts(Array.isArray(nextAlerts) ? nextAlerts as JsonRecord[] : [])
       setSelectedId(null)
       setGroupOverviewId(null)
     }).catch(() => undefined)
@@ -685,15 +943,18 @@ function ModerationPoliciesModal({ close }: { close: () => void }) {
   return <Modal title="Políticas de moderación" close={close}><div className="moderation-policies"><p>Este borrador guía las decisiones operativas de Qüata. Cada intervención debe ser necesaria, proporcionada y quedar registrada.</p><section><b>1. Prioridad de seguridad</b><span>Retira de inmediato contenido que implique riesgo de menores, amenazas creíbles, violencia explícita, explotación o difusión de información personal sensible.</span></section><section><b>2. Acoso, odio e impersonación</b><span>Evalúa el contexto y la reiteración. Retira contenido que ataque, humille o suplante de forma dañina a una persona o colectivo.</span></section><section><b>3. Spam y uso abusivo</b><span>Retira publicaciones, comentarios o mensajes automatizados, engañosos o repetitivos que deterioren la conversación.</span></section><section><b>4. Proporcionalidad y trazabilidad</b><span>Cuando no haya una infracción clara, marca el caso en revisión o descártalo. No uses la retirada de contenido como sustituto de un bloqueo personal.</span></section><section><b>5. Privacidad</b><span>Consulta solo los datos necesarios para resolver el caso y no copies información privada fuera de QOC.</span></section></div></Modal>
 }
 
-function OfficialModule({ data, editor, refresh }: { data: JsonRecord; editor: boolean; refresh: () => void }) {
-  const accounts = (data.accounts || []) as JsonRecord[];
+function OfficialModule({ data, editor, refresh, session }: { data: JsonRecord | null | undefined; editor: boolean; refresh: () => void; session: QocSession }) {
+  const editorialOnly = session.profile.isOfficial && !session.profile.isAdmin && session.roles.length === 0
+  const accounts = editorialOnly
+    ? [{ id: session.profile.id, name: session.profile.displayName, avatarUrl: session.profile.avatarUrl, territory: session.profile.territory || 'Ámbito nacional', isAdmin: false }]
+    : ((data?.accounts || []) as JsonRecord[])
   if (editor) return <OfficialPostsManager accounts={accounts} refresh={refresh} />
   return <OfficialDirectory refresh={refresh}/>
 }
 
 function OfficialDirectory({ refresh }: { refresh: () => void }) {
   const [profileQuery, setProfileQuery] = useState('')
-  const [territory, setTerritory] = useState('all')
+  const [territory, setTerritory] = useState(() => new URLSearchParams(window.location.search).get('barrio') || 'all')
   const [accountType, setAccountType] = useState('all')
   const [profilePage, setProfilePage] = useState(1)
   const [profileResult, setProfileResult] = useState<JsonRecord>({ items: [], total: 0, pageSize: 20, territories: [] })
@@ -962,33 +1223,476 @@ function UsersModule({ data, refresh }: { data: JsonRecord[]; refresh: () => voi
   return <Panel title="Directorio de usuarios" action="Buscar"><DataTable rows={data} columns={[['name','Usuario'],['territory','Barrio'],['joinedAt','Registro'],['lastLoginAt','Último acceso']]} action={(row) => <span className="role-pills"><button disabled={busy === String(row.id)} className={row.isAdmin ? 'pill active' : 'pill'} onClick={() => toggle(row,'isAdmin')}>Admin</button><button disabled={busy === String(row.id)} className={row.isOfficial ? 'pill official' : 'pill'} onClick={() => toggle(row,'isOfficial')}>Oficial</button></span>} /></Panel>
 }
 
-function CampaignModule({ data, refresh }: { data: JsonRecord[]; refresh: () => void }) {
-  const [open, setOpen] = useState(false); const [busy, setBusy] = useState(false); const create = async (event: React.FormEvent<HTMLFormElement>) => { event.preventDefault(); const values = new FormData(event.currentTarget); setBusy(true); try { await qocCommand('campaign.create',{name:values.get('name'),title:values.get('title'),body:values.get('body'),locale:values.get('locale'),channel:'push'}); setOpen(false); refresh() } finally { setBusy(false) } }
-  return <><div className="campaign-toolbar"><div><b>{data.filter((item) => item.status !== 'completed').length} campañas en curso</b><span>Las audiencias sensibles permanecen restringidas por diseño.</span></div><button className="primary" onClick={() => setOpen(true)}><Plus size={16}/>Nueva campaña</button></div><Panel title="Campañas y comunicaciones"><DataTable rows={data} columns={[['name','Campaña'],['objective','Objetivo'],['channel','Canal'],['status','Estado'],['locale','Idioma'],['created_at','Creada']]} /></Panel>{open && <Modal title="Nueva campaña" close={() => setOpen(false)}><form className="editor-form" onSubmit={create}><label>Nombre<input name="name" required placeholder="Recordatorio de servicio"/></label><label>Título<input name="title" required/></label><label>Mensaje<textarea name="body" required rows={5}/></label><label>Idioma<select name="locale"><option value="es">Español</option><option value="fr">Français</option><option value="en">English</option></select></label><button className="primary" disabled={busy}>{busy ? 'Guardando...' : 'Crear borrador'}</button></form></Modal>}</>
-}
 
 function SupportModule({ data, refresh }: { data: JsonRecord[]; refresh: () => void }) { const [open, setOpen] = useState(false); return <><button className="primary floating-action" onClick={() => setOpen(true)}><Plus size={16}/>Abrir incidencia</button><Panel title="Centro de soporte"><DataTable rows={data} columns={[['id','#'],['subject','Asunto'],['priority','Prioridad'],['status','Estado'],['created_at','Creada']]} /></Panel>{open && <Modal title="Nueva incidencia" close={() => setOpen(false)}><TicketForm onDone={() => { setOpen(false); refresh() }}/></Modal>}</> }
 function TicketForm({ onDone }: { onDone: () => void }) { const [busy,setBusy]=useState(false); const submit=async(e:React.FormEvent<HTMLFormElement>)=>{e.preventDefault();const f=new FormData(e.currentTarget);setBusy(true);try{await qocCommand('ticket.create',{subject:f.get('subject'),description:f.get('description'),priority:f.get('priority')});onDone()}finally{setBusy(false)}};return <form className="editor-form" onSubmit={submit}><label>Asunto<input name="subject" required/></label><label>Descripción<textarea name="description" rows={5}/></label><label>Prioridad<select name="priority"><option value="normal">Normal</option><option value="high">Alta</option><option value="critical">Crítica</option></select></label><button className="primary" disabled={busy}>Crear incidencia</button></form> }
 
-function AnalyticsModule({ data, title }: { data: JsonRecord; title: string }) { const series=(data.series||[]) as JsonRecord[]; const chat=(data.chat||{}) as JsonRecord; const content=(data.content||{}) as JsonRecord; return <><div className="kpi-grid"><Metric label="Conversaciones" value={chat.threads}/><Metric label="Mensajes" value={chat.messages}/><Metric label="Adjuntos" value={chat.attachments}/><Metric label="Publicaciones oficiales" value={content.officialPosts}/></div><Panel title={`Evolución · ${title}`} action="Últimos 14 días"><div className="chart-wrap"><ResponsiveContainer width="100%" height={280}><AreaChart data={series}><defs><linearGradient id="qoc-gradient" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#f97316" stopOpacity=".38"/><stop offset="1" stopColor="#f97316" stopOpacity="0"/></linearGradient></defs><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date" tickFormatter={(value) => String(value).slice(5)}/><YAxis/><Tooltip/><Area dataKey="users" stroke="#f97316" fill="url(#qoc-gradient)" strokeWidth={2}/></AreaChart></ResponsiveContainer></div></Panel><div className="dashboard-grid"><Panel title="Calidad de datos"><div className="tasks"><p><span className="severity success"/>Eventos de chat agregados <b>Disponible</b></p><p><span className="severity info"/>Lecturas y entregas <b>Disponible</b></p><p><span className="severity warning"/>Retención por cohortes <b>Por instrumentar</b></p></div></Panel><Panel title="Privacidad"><p className="muted">Los indicadores se muestran de forma agregada. El QOC no expone contenidos privados de chat en las vistas analíticas.</p></Panel></div></> }
+function AnalyticsModule({ scope, title, refreshSignal }: { scope: 'users' | 'content' | 'chat' | 'sos'; title: string; refreshSignal: () => void }) {
+  const [days, setDays] = useState(30)
+  const [data, setData] = useState<JsonRecord | null>(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError('')
+    getAnalytics(scope, days).then((next) => { if (active) setData(next as JsonRecord) }).catch(() => { if (active) setError('No se han podido cargar las métricas de este ámbito.') }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [days, refreshSignal, scope])
+
+  if (loading) return <div className="territory-loading"><span className="spinner"/>Actualizando métricas…</div>
+  if (error || !data) return <div className="territory-error"><CircleAlert size={18}/><span>{error || 'No hay datos disponibles.'}</span></div>
+
+  const kpis = (data.kpis || []) as JsonRecord[]
+  const series = (data.series || []) as JsonRecord[]
+  const period = <select className="analytics-period" value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={7}>Últimos 7 días</option><option value={30}>Últimos 30 días</option><option value={90}>Últimos 90 días</option></select>
+  const chart = scope === 'users'
+    ? <LineChart data={series}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date" tickFormatter={(value) => String(value).slice(5)}/><YAxis allowDecimals={false}/><Tooltip/><Line type="monotone" dataKey="registered" name="Altas" stroke="#f97316" strokeWidth={3} dot={false}/><Line type="monotone" dataKey="total" name="Total acumulado" stroke="#2563eb" strokeWidth={2} dot={false}/></LineChart>
+    : scope === 'content'
+      ? <AreaChart data={series}><defs><linearGradient id="qoc-content-feed" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#f97316" stopOpacity=".4"/><stop offset="1" stopColor="#f97316" stopOpacity="0"/></linearGradient></defs><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date" tickFormatter={(value) => String(value).slice(5)}/><YAxis allowDecimals={false}/><Tooltip/><Area type="monotone" dataKey="feed" name="Feed" stroke="#f97316" fill="url(#qoc-content-feed)"/><Area type="monotone" dataKey="official" name="Oficiales" stroke="#16a34a" fill="transparent"/></AreaChart>
+      : scope === 'chat'
+        ? <LineChart data={series}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date" tickFormatter={(value) => String(value).slice(5)}/><YAxis allowDecimals={false}/><Tooltip/><Line type="monotone" dataKey="messages" name="Mensajes" stroke="#2563eb" strokeWidth={3} dot={false}/><Line type="monotone" dataKey="attachments" name="Adjuntos" stroke="#f97316" strokeWidth={2} dot={false}/></LineChart>
+        : <AreaChart data={series}><defs><linearGradient id="qoc-sos-alerts" x1="0" y1="0" x2="0" y2="1"><stop stopColor="#dc2626" stopOpacity=".35"/><stop offset="1" stopColor="#dc2626" stopOpacity="0"/></linearGradient></defs><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date" tickFormatter={(value) => String(value).slice(5)}/><YAxis allowDecimals={false}/><Tooltip/><Area type="monotone" dataKey="alerts" name="Alertas" stroke="#dc2626" fill="url(#qoc-sos-alerts)"/><Line type="monotone" dataKey="geolocated" name="Con ubicación" stroke="#2563eb" strokeWidth={2} dot={false}/></AreaChart>
+
+  const detail = scope === 'users'
+    ? <Panel title="Usuarios por barrio"><div className="analytics-detail-panel"><AnalyticsList rows={(data.territories || []) as JsonRecord[]} label="Usuarios" value="users"/></div></Panel>
+    : scope === 'content'
+      ? <Panel title="Autores más activos en el feed"><div className="analytics-detail-panel"><AnalyticsList rows={(data.authors || []) as JsonRecord[]} label="Publicaciones" value="posts"/></div></Panel>
+      : scope === 'chat'
+        ? <Panel title="Estados de entrega"><div className="analytics-detail-panel analytics-delivery"><Metric label="Entregados" value={(data.delivery as JsonRecord)?.delivered}/><Metric label="Leídos" value={(data.delivery as JsonRecord)?.read}/><Metric label="Pendientes" value={(data.delivery as JsonRecord)?.pending}/></div></Panel>
+        : <Panel title="Últimas solicitudes SOS"><div className="analytics-detail-panel analytics-sos-list">{((data.recent || []) as JsonRecord[]).length ? ((data.recent || []) as JsonRecord[]).map((item, index) => <div key={`${String(item.at)}-${index}`}><span className={`severity ${item.hasLocation ? 'success' : 'warning'}`}/><b>{String(item.sender || 'Usuario')}</b><small>{dateTime(item.at)} · {item.hasLocation ? 'Ubicación disponible' : 'Sin ubicación'} · {formatNumber(item.sentCount)} destinatarios</small></div>) : <p className="muted">No hay alertas en el periodo.</p>}</div></Panel>
+
+  return <>
+    <div className="kpi-grid">{kpis.map((item) => <Metric key={String(item.label)} label={String(item.label)} value={item.value}/>)}</div>
+    <Panel title={`Evolución · ${title}`} action={period}><div className="chart-wrap"><ResponsiveContainer width="100%" height={300}>{chart}</ResponsiveContainer></div></Panel>
+    <div className="dashboard-grid">{detail}<Panel title="Lectura operativa"><div className="analytics-detail-panel"><p className="muted">{scope === 'users' ? 'Las altas y los accesos recientes muestran el crecimiento de la red por barrio.' : scope === 'content' ? 'Se distinguen las publicaciones del feed y del muro oficial. Las versiones traducidas de una misma publicación oficial se agrupan.' : scope === 'chat' ? 'Los estados se calculan a partir de los callbacks DELIVERED y READ registrados por los dispositivos.' : 'Una alerta se considera activa durante sus primeras 24 horas. Las coordenadas 0,0 no se consideran una ubicación válida.'}</p></div></Panel></div>
+  </>
+}
+
+function formatBytes(value: unknown) {
+  const bytes = Number(value || 0)
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1)
+  return `${(bytes / 1024 ** exponent).toFixed(exponent === 0 ? 0 : 1)} ${units[exponent]}`
+}
+
+function formatDurationMs(value: unknown) {
+  const milliseconds = Number(value || 0)
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return '0 ms'
+  const seconds = milliseconds / 1000
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`
+  const minutes = seconds / 60
+  if (minutes < 60) return `${minutes.toFixed(minutes < 10 ? 1 : 0)} min`
+  const hours = minutes / 60
+  if (hours < 24) return `${hours.toFixed(hours < 10 ? 1 : 0)} h`
+  const days = hours / 24
+  if (days < 7) return `${days.toFixed(days < 10 ? 1 : 0)} d`
+  return `${(days / 7).toFixed(1)} sem`
+}
+
+function MonitoringModule({ refreshKey }: { refreshKey: number }) {
+  const [days, setDays] = useState(7)
+  const [data, setData] = useState<JsonRecord | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [serviceInfo, setServiceInfo] = useState<JsonRecord | null>(null)
+  const probedRefreshKey = useRef<number | null>(null)
+
+  useEffect(() => {
+    let active = true
+    const load = async () => {
+      setLoading(true); setError('')
+      if (probedRefreshKey.current !== refreshKey) {
+        probedRefreshKey.current = refreshKey
+        await runMonitoringProbe().catch(() => undefined)
+      }
+      try {
+        const next = await getMonitoring(days)
+        if (active) setData(next as JsonRecord)
+      } catch {
+        if (active) setError('No se han podido cargar las métricas técnicas.')
+      } finally {
+        if (active) setLoading(false)
+      }
+    }
+    void load()
+    return () => { active = false }
+  }, [days, refreshKey])
+
+  if (loading) return <div className="territory-loading"><span className="spinner"/>Cargando estado técnico…</div>
+  if (error || !data) return <div className="territory-error"><CircleAlert size={18}/><span>{error || 'No hay datos de monitorización disponibles.'}</span></div>
+
+  const latest = (data.latest || {}) as JsonRecord
+  const history = (data.history || []) as JsonRecord[]
+  const services = (data.services || []) as JsonRecord[]
+  const tables = (data.tableHealth || []) as JsonRecord[]
+  const queries = (data.queryHealth || []) as JsonRecord[]
+  const statusLabel: Record<string, string> = { operational: 'Operativo', attention: 'Atención', unknown: 'Sin señal', unmonitored: 'Sin sonda' }
+
+  return <>
+    <div className="monitoring-summary">
+      <div><span className={`monitoring-dot ${services.some((item) => item.status === 'attention') ? 'attention' : 'ok'}`}/><b>{services.some((item) => item.status === 'attention') ? 'Revisar señales operativas' : 'Monitorización operativa'}</b><small>Última captura: {latest.captured_at ? dateTime(latest.captured_at) : 'pendiente'}</small></div>
+      <label>Periodo<select value={days} onChange={(event) => setDays(Number(event.target.value))}><option value={1}>Últimas 24 h</option><option value={7}>Últimos 7 días</option><option value={30}>Últimos 30 días</option></select></label>
+    </div>
+    <div className="kpi-grid monitoring-kpis">
+      <Metric label="Conexiones activas" value={latest.active_connections}/>
+      <Metric label="Push enviados · 24 h" value={latest.push_sent_24h}/>
+      <Metric label="Errores push · 24 h" value={latest.push_errors_24h}/>
+      <Metric label="Pendientes > 15 min" value={latest.pending_delivery_15m}/>
+    </div>
+    <Panel title="Estado de dependencias"><div className="monitoring-services">{services.map((service) => <button key={String(service.key)} onClick={() => setServiceInfo(service)}><span className={`monitoring-dot ${String(service.status)}`}/><span><b>{String(service.name)}</b><small>{statusLabel[String(service.status)] || 'Sin señal'}</small></span><Info size={16}/></button>)}</div></Panel>
+    <Panel title="Mensajería y confirmaciones"><div className="chart-wrap"><ResponsiveContainer width="100%" height={280}><LineChart data={history}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="at" tickFormatter={(value) => new Intl.DateTimeFormat('es-ES', { day: '2-digit', month: 'short', hour: '2-digit' }).format(new Date(String(value)))} minTickGap={35}/><YAxis allowDecimals={false}/><Tooltip labelFormatter={(value) => dateTime(value)} /><Line type="monotone" dataKey="delivered" name="Entregados" stroke="#2563eb" strokeWidth={2.5} dot={false}/><Line type="monotone" dataKey="read" name="Leídos" stroke="#16a34a" strokeWidth={2.5} dot={false}/><Line type="monotone" dataKey="pendingDelivery" name="Pendientes" stroke="#ea580c" strokeWidth={2.5} dot={false}/><Line type="monotone" dataKey="pushErrors" name="Errores push" stroke="#dc2626" strokeWidth={2} dot={false}/></LineChart></ResponsiveContainer></div></Panel>
+    <div className="dashboard-grid monitoring-grid">
+      <Panel title="Capacidad y mantenimiento"><div className="monitoring-details"><div className="monitoring-capacity"><Metric label="Base de datos" value={formatBytes(latest.database_bytes)}/><Metric label="Tablas de usuario" value={formatBytes(latest.user_table_bytes)}/><Metric label="Filas pendientes de limpiar" value={latest.dead_rows}/><Metric label="Bloqueos acumulados" value={latest.deadlocks}/></div><div className="monitoring-table-list">{tables.map((table) => <div key={String(table.name)}><span><b>{String(table.name)}</b><small>{formatNumber(table.estimated_rows)} filas estimadas · {formatNumber(table.dead_rows)} muertas</small></span><strong>{formatBytes(table.total_bytes)}</strong></div>)}</div></div></Panel>
+      <Panel title="Carga de consultas"><div className="monitoring-query-list">{queries.map((query, index) => <div key={`${String(query.family)}-${index}`}><span><b>{String(query.family)}</b><small>{formatNumber(query.calls)} ejecuciones · media {String(query.mean_ms)} ms</small></span><strong>{formatDurationMs(query.total_ms)}</strong></div>)}<p className="muted">Tiempo total acumulado desde el último reinicio de estadísticas. Las consultas se agrupan por familia técnica; el SQL no se expone en el panel.</p></div></Panel>
+    </div>
+    {serviceInfo && <Modal title={`Estado de ${String(serviceInfo.name)}`} close={() => setServiceInfo(null)}><div className="monitoring-service-modal"><span className={`monitoring-dot ${String(serviceInfo.status)}`}/><div><b>{statusLabel[String(serviceInfo.status)] || 'Sin señal'}</b><p>{String(serviceInfo.detail || '')}</p>{serviceInfo.status === 'unmonitored' && <small>Esta dependencia no se clasifica como disponible hasta que una sonda propia registre comprobaciones reales.</small>}</div></div></Modal>}
+  </>
+}
+
+function AnalyticsList({ rows, label, value }: { rows: JsonRecord[]; label: string; value: string }) {
+  return <div className="analytics-list">{rows.length ? rows.map((item, index) => <div key={`${String(item.name)}-${index}`}><span>{index + 1}</span><b>{String(item.name || 'Sin nombre')}</b><strong>{formatNumber(item[value])} <small>{label.toLowerCase()}</small></strong></div>) : <p className="muted">No hay datos suficientes para este desglose.</p>}</div>
+}
 
 
-function TranslationsModule({ data, refresh }: { data: JsonRecord[]; refresh: () => void }) { const [busy,setBusy]=useState(false); const create=async()=>{setBusy(true);try{await qocCommand('translation.create',{sourceType:'manual',sourceId:'manual',sourceLocale:'es',targetLocale:'fr',sourceText:'Texto de prueba para revisión humana.'});refresh()}finally{setBusy(false)}};return <><div className="translation-banner"><Languages size={22}/><div><b>Traducción supervisada</b><p>Las versiones oficiales requieren revisión antes de publicación crítica.</p></div><button className="secondary" onClick={create} disabled={busy}>Añadir a la cola</button></div><Panel title="Cola de traducción"><DataTable rows={data} columns={[['source_type','Origen'],['source_locale','Desde'],['target_locale','A'],['status','Estado'],['created_at','Creada']]} /></Panel></> }
+function auditActionLabel(value: unknown) {
+  const action = String(value || '')
+  return ({
+    'user.role.toggle': 'Cambio de rol',
+    'moderation.remove_content': 'Retirada de contenido',
+    'moderation.reviewing': 'Marcado en revisión',
+    'moderation.update': 'Actualización de moderación',
+  } as Record<string, string>)[action] || action.replaceAll('.', ' · ').replaceAll('_', ' ')
+}
 
-function AuditModule({ data }: { data: JsonRecord[] }) { return <Panel title="Registro de auditoría" action="Exportar"><DataTable rows={data} columns={[['action','Acción'],['entityType','Entidad'],['actor','Responsable'],['reason','Motivo'],['createdAt','Fecha']]} /></Panel> }
+function auditEntityLabel(value: unknown) {
+  return ({ profile: 'Perfil', ugc_report: 'Reporte de moderación' } as Record<string, string>)[String(value || '')] || String(value || '—').replaceAll('_', ' ')
+}
 
-function PlatformModule({ data, mode }: { data: JsonRecord; mode: string }) { const settings=(data.settings||[]) as JsonRecord[]; const flags=(data.flags||[]) as JsonRecord[]; if(mode==='versiones') return <><div className="kpi-grid"><Metric label="Última versión Android" value={(data.versions as JsonRecord)?.androidLatest}/><Metric label="Target SDK" value={(data.versions as JsonRecord)?.targetSdk}/><Metric label="Compatibilidad mínima" value={`API ${(data.versions as JsonRecord)?.minSdk}`}/><Metric label="Release channel" value="Producción"/></div><Panel title="Checklist de release"><div className="checklist">{['Build firmado y probado','Notas de versión localizadas','Compatibilidad Android revisada','Plan de rollback definido','Métricas de despliegue activas'].map((item)=><p key={item}>✓ {item}</p>)}</div></Panel></>; if(mode==='cumplimiento') return <div className="compliance-grid">{['Acceso con mínimo privilegio','Auditoría de acciones administrativas','Datos sensibles restringidos por RPC','Retención y exportaciones gobernadas','RLS habilitado en datos QOC','Secretos fuera del cliente'].map((item,index)=><Panel key={item} title={item}><span className={`compliance-state ${index===5?'attention':'ok'}`}>{index===5?'Revisar configuración':'Control activo'}</span><p className="muted">Consulta el registro de auditoría y la política asociada antes de modificar este control.</p></Panel>)}</div>; return <><Panel title="Configuración de plataforma"><DataTable rows={settings} columns={[['key','Clave'],['value','Valor'],['updatedAt','Actualizada']]} /></Panel><Panel title="Feature flags"><DataTable rows={flags} columns={[['key','Flag'],['description','Descripción'],['enabled','Activo'],['rollout_percent','Despliegue (%)']]} /></Panel></> }
+function AuditModule({ refreshSignal }: { refreshSignal: () => void }) {
+  const [query, setQuery] = useState('')
+  const [action, setAction] = useState('all')
+  const [entityType, setEntityType] = useState('all')
+  const [page, setPage] = useState(1)
+  const [result, setResult] = useState<JsonRecord>({ items: [], total: 0, page: 1, pageSize: 20, filters: {} })
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [reload, setReload] = useState(0)
 
-function Roadmap() { const phases=[['Fase 0','Fundamentos','Login, RBAC, shell y auditoría'],['Fase 1','MVP institucional','Cuentas oficiales, editor y biblioteca'],['Fase 2','Centro SOS','Cola, mapa, detalle y SLA'],['Fase 3','Moderación','Reportes, sanciones y soporte'],['Fase 4–5','Comunicación y analítica','Campañas, métricas e informes'],['Fase 6–8','Gobierno y evolución','Videowall, seguridad, traducción e IA']]; return <div className="roadmap">{phases.map(([phase,title,description],index)=><article key={phase}><span>{String(index+1).padStart(2,'0')}</span><div><p>{phase}</p><h3>{title}</h3><small>{description}</small></div><i/></article>)}</div> }
+  useEffect(() => {
+    let active = true
+    const timer = window.setTimeout(() => {
+      setLoading(true); setError('')
+      getAuditEvents(query, action, entityType, page).then((next) => { if (active) setResult(next as JsonRecord) }).catch(() => {
+        if (active) setError('No se ha podido cargar el registro de auditoría.')
+      }).finally(() => { if (active) setLoading(false) })
+    }, 180)
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [query, action, entityType, page, reload, refreshSignal])
+
+  const items = ((result.items || []) as JsonRecord[]).map((item) => ({ ...item, actionLabel: auditActionLabel(item.action), entityLabel: auditEntityLabel(item.entityType) }))
+  const filters = (result.filters || {}) as JsonRecord
+  const actions = (filters.actions || []) as string[]
+  const entities = (filters.entityTypes || []) as string[]
+  const total = Number(result.total || 0)
+  const pageSize = Number(result.pageSize || 20)
+  const pages = Math.max(1, Math.ceil(total / pageSize))
+  const changeQuery = (value: string) => { setQuery(value); setPage(1) }
+  const changeAction = (value: string) => { setAction(value); setPage(1) }
+  const changeEntity = (value: string) => { setEntityType(value); setPage(1) }
+
+  return <>
+    <div className="territory-toolbar">
+      <label className="territory-search"><Search size={16}/><input value={query} onChange={(event) => changeQuery(event.target.value)} placeholder="Buscar por responsable, acción, entidad o nota" aria-label="Buscar en auditoría"/></label>
+      <label>Acción<select value={action} onChange={(event) => changeAction(event.target.value)}><option value="all">Todas</option>{actions.map((item) => <option key={item} value={item}>{auditActionLabel(item)}</option>)}</select></label>
+      <label>Entidad<select value={entityType} onChange={(event) => changeEntity(event.target.value)}><option value="all">Todas</option>{entities.map((item) => <option key={item} value={item}>{auditEntityLabel(item)}</option>)}</select></label>
+    </div>
+    <Panel title="Registro de auditoría" action={`${total} eventos`}>
+      {error ? <div className="territory-error"><CircleAlert size={18}/><span>{error}</span><button className="secondary" onClick={() => setReload((value) => value + 1)}>Reintentar</button></div> : loading ? <div className="territory-loading"><span className="spinner"/>Actualizando auditoría…</div> : <><DataTable rows={items} columns={[['actionLabel','Acción'],['entityLabel','Entidad'],['entityId','Identificador'],['actor','Responsable'],['reason','Nota'],['createdAt','Fecha']]} /><DirectoryPagination page={page} total={total} pageSize={pageSize} pages={pages} onPage={setPage}/></>}
+    </Panel>
+  </>
+}
+
+function PlatformModule({ data, mode, refreshKey }: { data: JsonRecord | null; mode: string; refreshKey: number }) {
+  const safeData = data || {}
+  if (mode === 'versiones') return <PlayVersionsModule fallbackVersions={(safeData.versions || {}) as JsonRecord} refreshKey={refreshKey} />
+  return <div className="compliance-grid">{['Acceso con mínimo privilegio','Auditoría de acciones administrativas','Datos sensibles restringidos por RPC','Retención y exportaciones gobernadas','RLS habilitado en datos QOC','Secretos fuera del cliente'].map((item,index)=><Panel key={item} title={item}><span className={`compliance-state ${index===5?'attention':'ok'}`}>{index===5?'Revisar configuración':'Control activo'}</span><p className="muted">Consulta el registro de auditoría y la política asociada antes de modificar este control.</p></Panel>)}</div>
+}
+
+function ComplianceModule({ refreshKey }: { refreshKey: number }) {
+  const navigate = useNavigate()
+  const [data, setData] = useState<JsonRecord | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError('')
+    getComplianceOverview().then((value) => { if (active) setData(value) }).catch(() => {
+      if (active) setError('No se ha podido obtener el estado de seguridad y cumplimiento.')
+    }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [refreshKey])
+
+  if (loading) return <div className="territory-loading"><span className="spinner"/>Comprobando controles y trazabilidad…</div>
+  if (error || !data) return <div className="territory-error"><CircleAlert size={18}/><span>{error || 'No hay datos disponibles.'}</span></div>
+
+  const rls = (data.rls || {}) as JsonRecord
+  const privileges = (data.privilegedAccounts || {}) as JsonRecord
+  const operationalData = (data.data || {}) as JsonRecord
+  const integrations = (data.integrations || {}) as JsonRecord
+  const unprotected = (rls.unprotected || []) as JsonRecord[]
+  const activity = (data.activity || []) as JsonRecord[]
+  const services = (integrations.services || []) as JsonRecord[]
+  const coverage = Number(rls.totalTables || 0) ? Math.round((Number(rls.enabledTables || 0) / Number(rls.totalTables || 1)) * 100) : 0
+
+  return <>
+    <div className="info-banner compliance-intro"><Info size={18}/><div><b>Señales verificables, no declaraciones de cumplimiento</b><p>Este panel muestra el estado actual de los controles técnicos y de la trazabilidad. No expone secretos ni sustituye una auditoría legal.</p></div></div>
+    <div className="kpi-grid">
+      <Metric label="Cobertura RLS" value={`${coverage}%`}/>
+      <Metric label="Tablas sin RLS" value={rls.disabledTables}/>
+      <Metric label="Administradores activos" value={privileges.administrators}/>
+      <Metric label="Casos de moderación abiertos" value={operationalData.openReports}/>
+    </div>
+    <div className="split-grid compliance-panels">
+      <Panel title="Acceso a datos" action={<button className="secondary compact-action" onClick={() => navigate('/auditoria')}>Ver auditoría</button>}>
+        <div className="compliance-body">
+          <p><b>{formatNumber(rls.enabledTables)}</b> de {formatNumber(rls.totalTables)} tablas de aplicación tienen RLS habilitado.</p>
+          {unprotected.length ? <div className="compliance-finding attention"><CircleAlert size={16}/><div><b>Excepciones pendientes de endurecimiento</b><span>{unprotected.map((item) => String(item.table)).join(', ')}</span></div></div> : <div className="compliance-finding ok"><Activity size={16}/><div><b>Sin tablas de aplicación sin RLS</b><span>La cobertura actual no muestra excepciones.</span></div></div>}
+          <small className="muted">Las excepciones se registran para su revisión; este panel no modifica políticas por sí solo.</small>
+        </div>
+      </Panel>
+      <Panel title="Accesos privilegiados" action={<button className="secondary compact-action" onClick={() => navigate('/usuarios')}>Gestionar usuarios</button>}>
+        <div className="compliance-body role-summary"><p><b>{formatNumber(privileges.administrators)}</b> administradores y <b>{formatNumber(privileges.officialAccounts)}</b> cuentas oficiales entre {formatNumber(privileges.profiles)} perfiles.</p><small className="muted">Los cambios de rol se registran en auditoría.</small></div>
+        <div className="timeline compact-timeline">{activity.length ? activity.slice(0, 4).map((item) => <div key={String(item.id)}><i/><div><b>{auditActionLabel(String(item.action || ''))}</b><small>{String(item.actor || 'Sistema')} · {dateTime(item.createdAt)}</small></div></div>) : <div className="no-activity">Sin actividad administrativa reciente.</div>}</div>
+      </Panel>
+    </div>
+    <div className="split-grid compliance-panels">
+      <Panel title="Datos y retención operativa">
+        <div className="compliance-stats">
+          <span><b>{formatNumber(operationalData.chatMessages)}</b> mensajes de chat visibles</span><span><b>{formatNumber(operationalData.deletedChatMessages)}</b> mensajes retirados</span><span><b>{formatNumber(operationalData.officialPosts)}</b> publicaciones oficiales activas</span><span><b>{formatNumber(operationalData.deletedOfficialPosts)}</b> publicaciones oficiales retiradas</span><span><b>{formatNumber(operationalData.attachments)}</b> adjuntos registrados</span><span><b>{formatNumber(operationalData.communityPosts)}</b> publicaciones de comunidad</span>
+        </div>
+      </Panel>
+      <Panel title="Integraciones y evidencias" action={<button className="secondary compact-action" onClick={() => navigate('/monitorizacion')}>Ver monitorización</button>}>
+        <div className="services compliance-services">{services.map((service) => <div key={String(service.key)}><span className={`status ${String(service.status || 'unknown')}`}/><b>{String(service.name)}</b><small>{String(service.status) === 'operational' ? 'Operativo' : String(service.status) === 'attention' ? 'Revisar' : 'Sin sonda'}</small></div>)}</div>
+        <div className="compliance-timestamps"><span>Último snapshot técnico: <b>{dateTime(integrations.monitoringSnapshotAt)}</b></span><span>Caché de Google Play: <b>{dateTime(integrations.googlePlayCacheAt)}</b></span></div>
+      </Panel>
+    </div>
+  </>
+}
+
+function lastVitalMetric(rows: JsonRecord[], key: string) {
+  for (const row of [...rows].reverse()) {
+    const metrics = (row.metrics || {}) as JsonRecord
+    const value = metrics[key] ?? row[key]
+    if (value !== undefined && value !== null) return String(value)
+  }
+  return 'Sin datos'
+}
+
+function PlayVersionsModule({ fallbackVersions, refreshKey }: { fallbackVersions: JsonRecord; refreshKey: number }) {
+  const [data, setData] = useState<JsonRecord | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    let active = true
+    setLoading(true); setError('')
+    getGooglePlayOverview().then((next) => { if (active) setData(next) }).catch(() => { if (active) setError('No se ha podido consultar Google Play.') }).finally(() => { if (active) setLoading(false) })
+    return () => { active = false }
+  }, [refreshKey])
+
+  if (loading) return <div className="territory-loading"><span className="spinner"/>Consultando Google Play…</div>
+  if (error || !data) return <div className="territory-error"><CircleAlert size={18}/><span>{error || 'No hay datos de Google Play disponibles.'}</span></div>
+
+  const tracks = (data.tracks || []) as JsonRecord[]
+  const production = tracks.find((track) => track.track === 'production') || {}
+  const release = ((production.releases || []) as JsonRecord[])[0] || {}
+  const vitals = (data.vitals || {}) as JsonRecord
+  const crashRows = (vitals.crash || []) as JsonRecord[]
+  const anrRows = (vitals.anr || []) as JsonRecord[]
+  const anomalies = (vitals.anomalies || []) as JsonRecord[]
+  const app = (data.app || {}) as JsonRecord
+  const versionCodes = (release.versionCodes || []) as unknown[]
+  const releaseStatus = String(release.status || 'Sin publicación')
+
+  return <>
+    <div className="kpi-grid">
+      <Metric label="Versión en producción" value={release.name || fallbackVersions.androidLatest || '—'}/>
+      <Metric label="Version code" value={versionCodes[0] || '—'}/>
+      <Metric label="Target SDK" value={fallbackVersions.targetSdk}/>
+      <Metric label="Estado de publicación" value={releaseStatus === 'completed' ? 'Producción' : releaseStatus}/>
+    </div>
+    <div className="split-grid">
+      <Panel title="Distribución en Google Play"><div className="checklist"><p><b>Aplicación:</b> {String(app.displayName || 'Qüata')} <span className="muted">({String(app.packageName || 'com.quata')})</span></p><p><b>Canal:</b> Producción</p><p><b>Última sincronización:</b> {dateTime(data.cachedAt || data.refreshedAt)}</p><p><b>Release notes:</b> {((release.releaseNotes || []) as unknown[]).length} idiomas disponibles</p></div></Panel>
+      <Panel title="Android vitals"><div className="checklist"><p><b>Crash rate (7 días):</b> {lastVitalMetric(crashRows, 'crashRate7dUserWeighted')}</p><p><b>ANR rate (7 días):</b> {lastVitalMetric(anrRows, 'anrRate7dUserWeighted')}</p><p><b>Anomalías abiertas:</b> {formatNumber(anomalies.length)}</p><p className="muted">Google Play puede tardar hasta un día en publicar la muestra agregada.</p></div></Panel>
+    </div>
+    <Panel title="Tracks de distribución"><DataTable rows={tracks.map((track) => { const firstRelease = ((track.releases || []) as JsonRecord[])[0] || {}; return { track: track.track, version: firstRelease.name || '—', versionCode: ((firstRelease.versionCodes || []) as unknown[])[0] || '—', status: firstRelease.status || 'Sin publicación', releaseNotes: ((firstRelease.releaseNotes || []) as unknown[]).length } })} columns={[['track','Track'],['version','Versión'],['versionCode','Version code'],['status','Estado'],['releaseNotes','Idiomas de notas']]} /></Panel>
+  </>
+}
+
+function CommunitiesModule() {
+  const navigate = useNavigate()
+  const [query, setQuery] = useState('')
+  const [status, setStatus] = useState('all')
+  const [activity, setActivity] = useState('all')
+  const [page, setPage] = useState(1)
+  const [result, setResult] = useState<JsonRecord>({ items: [], total: 0, page: 1, pageSize: 20 })
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [reload, setReload] = useState(0)
+  const updateFilter = (setter: (value: string) => void, value: string) => { setter(value); setPage(1) }
+
+  useEffect(() => {
+    let alive = true
+    const timer = window.setTimeout(() => {
+      setLoading(true); setError('')
+      getCommunities(query, status, activity, page).then((value) => {
+        if (alive) setResult(value as JsonRecord)
+      }).catch(() => {
+        if (alive) setError('No se ha podido cargar el directorio de comunidades.')
+      }).finally(() => { if (alive) setLoading(false) })
+    }, 180)
+    return () => { alive = false; window.clearTimeout(timer) }
+  }, [query, status, activity, page, reload])
+
+  const items = (result.items || []) as JsonRecord[]
+  const total = Number(result.total || 0)
+  const pageSize = Number(result.pageSize || 20)
+  const pages = Math.max(1, Math.ceil(total / pageSize))
+  return <>
+    <div className="territory-toolbar">
+      <label className="territory-search"><Search size={16}/><input value={query} onChange={(event) => updateFilter(setQuery, event.target.value)} placeholder="Buscar por comunidad, ciudad o descripción"/></label>
+      <label>Estado<select value={status} onChange={(event) => updateFilter(setStatus, event.target.value)}><option value="all">Todos</option><option value="active">Activas</option><option value="inactive">Inactivas</option></select></label>
+      <label>Actividad<select value={activity} onChange={(event) => updateFilter(setActivity, event.target.value)}><option value="all">Toda</option><option value="recent">Con actividad reciente</option><option value="quiet">Sin actividad reciente</option></select></label>
+    </div>
+    <Panel title="Gestión territorial" action={`${total} comunidades`}>
+      {error ? <div className="territory-error"><CircleAlert size={18}/><span>{error}</span><button className="secondary" onClick={() => setReload((value) => value + 1)}>Reintentar</button></div> : loading ? <div className="territory-loading"><span className="spinner"/>Actualizando comunidades…</div> : <>
+        <div className="table-wrap"><table><thead><tr><th>Comunidad</th><th>Ciudad</th><th>Miembros</th><th>Publicaciones</th><th>Última actividad</th><th>Estado</th></tr></thead><tbody>{items.length ? items.map((community) => <tr key={String(community.id)}><td><b>{String(community.name || 'Comunidad sin nombre')}</b><small className="community-description">{String(community.description || 'Sin descripción')}</small></td><td>{community.city ? String(community.city) : <span className="muted">—</span>}</td><td><button className="community-members-link" onClick={() => navigate(`/usuarios?barrio=${encodeURIComponent(String(community.name || ''))}`)} title={`Ver usuarios de ${String(community.name || 'esta comunidad')}`}>{formatNumber(community.memberCount)}</button></td><td>{formatNumber(community.postCount)}</td><td>{community.lastPostAt ? dateTime(community.lastPostAt) : <span className="muted">Sin publicaciones</span>}</td><td><span className={`badge ${community.isActive ? 'success' : 'neutral'}`}>{community.isActive ? 'Activa' : 'Inactiva'}</span></td></tr>) : <tr><td className="no-results" colSpan={6}>No hay comunidades para estos filtros.</td></tr>}</tbody></table></div>
+        <DirectoryPagination page={page} total={total} pageSize={pageSize} pages={pages} onPage={setPage}/>
+      </>}
+    </Panel>
+  </>
+}
+
+function mediaKindLabel(kind: string) { return ({ all: 'Todos', image: 'Imágenes', video: 'Vídeos', audio: 'Audio', document: 'Documentos', file: 'Otros archivos' } as Record<string, string>)[kind] || kind }
+function fileSize(bytes: unknown) { const value = Number(bytes || 0); if (!Number.isFinite(value) || value <= 0) return 'Tamaño desconocido'; const units = ['B', 'KB', 'MB', 'GB']; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / (1024 ** index)).toFixed(index ? 1 : 0)} ${units[index]}` }
+const mediaSizeCache: globalThis.Map<string, number | null> = new globalThis.Map<string, number | null>()
+
+function useResolvedMediaSize(url: string, declaredSize: unknown) {
+  const initialSize = Number(declaredSize || 0)
+  const [size, setSize] = useState(Number.isFinite(initialSize) && initialSize > 0 ? initialSize : undefined)
+  const [checking, setChecking] = useState(!size && Boolean(url))
+  useEffect(() => {
+    const knownSize = Number(declaredSize || 0)
+    if (Number.isFinite(knownSize) && knownSize > 0) { setSize(knownSize); setChecking(false); return }
+    if (!url) { setChecking(false); return }
+    const cached = mediaSizeCache.get(url)
+    if (cached !== undefined) { setSize(cached || undefined); setChecking(false); return }
+    let active = true
+    const controller = new AbortController()
+    const readLength = (response: Response) => {
+      const contentLength = Number(response.headers.get('content-length') || 0)
+      const contentRange = response.headers.get('content-range') || ''
+      const rangedLength = Number(contentRange.split('/').pop() || 0)
+      return contentLength > 0 ? contentLength : rangedLength > 0 ? rangedLength : 0
+    }
+    const measure = async () => {
+      try {
+        let response = await fetch(url, { method: 'HEAD', signal: controller.signal })
+        let measured = readLength(response)
+        if (!measured) {
+          response = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: controller.signal })
+          measured = readLength(response)
+        }
+        mediaSizeCache.set(url, measured || null)
+        if (active) setSize(measured || undefined)
+      } catch {
+        mediaSizeCache.set(url, null)
+      } finally {
+        if (active) setChecking(false)
+      }
+    }
+    void measure()
+    return () => { active = false; controller.abort() }
+  }, [declaredSize, url])
+  return { size, checking }
+}
+
+function MediaLibraryModule() {
+  const [library, setLibrary] = useState<'chat' | 'post_images' | 'post_videos'>('chat')
+  const [query, setQuery] = useState('')
+  const [kind, setKind] = useState('all')
+  const [page, setPage] = useState(1)
+  const [result, setResult] = useState<JsonRecord>({ items: [], total: 0, page: 1, pageSize: 24 })
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [reload, setReload] = useState(0)
+  const [selected, setSelected] = useState<JsonRecord | null>(null)
+
+  useEffect(() => { setPage(1) }, [library, query, kind])
+  useEffect(() => {
+    let alive = true
+    const timer = window.setTimeout(() => {
+      setLoading(true); setError('')
+      getMediaLibrary(library, query, kind, page).then((value) => {
+        if (alive) setResult(value as JsonRecord)
+      }).catch(() => {
+        if (alive) setError('No se ha podido cargar la biblioteca multimedia.')
+      }).finally(() => { if (alive) setLoading(false) })
+    }, 180)
+    return () => { alive = false; window.clearTimeout(timer) }
+  }, [library, query, kind, page, reload])
+
+  const items = (result.items || []) as JsonRecord[]
+  const total = Number(result.total || 0)
+  const pageSize = Number(result.pageSize || 24)
+  const pages = Math.max(1, Math.ceil(total / pageSize))
+  return <>
+    <div className="media-library-tabs" role="tablist" aria-label="Fuentes multimedia">
+      <button role="tab" aria-selected={library === 'chat'} className={library === 'chat' ? 'active' : ''} onClick={() => setLibrary('chat')}>Adjuntos de chat</button>
+      <button role="tab" aria-selected={library === 'post_images'} className={library === 'post_images' ? 'active' : ''} onClick={() => setLibrary('post_images')}>Imágenes de publicaciones</button>
+      <button role="tab" aria-selected={library === 'post_videos'} className={library === 'post_videos' ? 'active' : ''} onClick={() => setLibrary('post_videos')}>Vídeos de publicaciones</button>
+    </div>
+    <div className="territory-toolbar media-library-toolbar">
+      <label className="territory-search"><Search size={16}/><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Buscar por nombre, extensión o tipo" /></label>
+      {library === 'chat' && <label>Tipo<select value={kind} onChange={(event) => setKind(event.target.value)}>{['all', 'image', 'video', 'audio', 'document', 'file'].map((value) => <option key={value} value={value}>{mediaKindLabel(value)}</option>)}</select></label>}
+    </div>
+    <Panel title="Biblioteca multimedia" action={`${total} archivos`}>
+      {error ? <div className="territory-error"><CircleAlert size={18}/><span>{error}</span><button className="secondary" onClick={() => setReload((value) => value + 1)}>Reintentar</button></div> : loading ? <div className="territory-loading"><span className="spinner"/>Cargando archivos…</div> : items.length ? <><div className="media-library-grid">{items.map((item) => <MediaLibraryCard key={String(item.id)} item={item} onOpen={() => setSelected(item)} />)}</div><DirectoryPagination page={page} total={total} pageSize={pageSize} pages={pages} onPage={setPage}/></> : <div className="empty-state"><Image size={30}/><b>No hay archivos para este filtro</b><span>Prueba con otro nombre o tipo de archivo.</span></div>}
+    </Panel>
+    {selected && <MediaLibraryPreview item={selected} close={() => setSelected(null)} />}
+  </>
+}
+
+function MediaLibraryCard({ item, onOpen }: { item: JsonRecord; onOpen: () => void }) {
+  const kind = String(item.kind || 'file')
+  const url = String(item.thumbnailUrl || item.url || '')
+  const sizeSourceUrl = String(item.url || '')
+  const resolvedSize = useResolvedMediaSize(sizeSourceUrl, item.sizeBytes)
+  return <button className="media-library-card" onClick={onOpen}>
+    <span className={`media-library-thumb ${kind}`}>{kind === 'image' && url ? <img src={url} alt=""/> : kind === 'video' && url ? <><video src={url} muted preload="metadata"/><i><Play size={24} fill="currentColor"/></i></> : kind === 'audio' ? <Activity size={31}/> : <FilePlus2 size={31}/>}</span>
+    <span className="media-library-copy"><b title={String(item.name)}>{String(item.name || 'Archivo sin nombre')}</b><small>{mediaKindLabel(kind)} · {resolvedSize.size ? fileSize(resolvedSize.size) : resolvedSize.checking ? 'Calculando tamaño…' : 'Tamaño no publicado'}</small><small>{dateTime(item.createdAt)}</small></span>
+  </button>
+}
+
+function MediaLibraryPreview({ item, close }: { item: JsonRecord; close: () => void }) {
+  const kind = String(item.kind || 'file')
+  const url = String(item.url || '')
+  const mime = String(item.mimeType || '')
+  const name = String(item.name || 'Archivo')
+  const resolvedSize = useResolvedMediaSize(url, item.sizeBytes)
+  const sizeLabel = resolvedSize.size ? fileSize(resolvedSize.size) : resolvedSize.checking ? 'Calculando tamaño…' : 'Tamaño no publicado'
+  return <Modal title={name} close={close}><div className="media-preview-modal"><div className="media-preview-stage">{kind === 'image' && <img src={url} alt={name}/>} {kind === 'video' && <video src={url} controls autoPlay preload="metadata"/>} {kind === 'audio' && <div className="media-audio-preview"><Activity size={40}/><audio controls autoPlay><source src={url} type={mime}/></audio></div>} {kind === 'document' && mime === 'application/pdf' && <iframe src={url} title={name}/>} {(kind === 'file' || (kind === 'document' && mime !== 'application/pdf')) && <div className="media-file-preview"><FilePlus2 size={42}/><b>{name}</b><span>Este archivo se abrirá en una pestaña nueva.</span></div>}</div><footer><span>{mediaKindLabel(kind)} · {sizeLabel} · {dateTime(item.createdAt)}</span><a className="secondary" href={url} target="_blank" rel="noreferrer"><ExternalLink size={15}/>Abrir archivo</a></footer></div></Modal>
+}
 
 function CollectionModule({ meta, data }: { meta: ModuleMeta; data: unknown; session: QocSession }) { const rows=Array.isArray(data)?data:[]; return <><div className="info-banner"><meta.icon size={20}/><div><b>Módulo conectado a datos de Qüata</b><p>La vista utiliza la fuente disponible y mantiene preparada su ampliación operativa conforme a {meta.source}.</p></div></div><Panel title={meta.label}>{rows.length ? <DataTable rows={rows as JsonRecord[]} columns={autoColumns(rows as JsonRecord[])}/> : <div className="empty-state"><meta.icon size={30}/><b>Sin datos disponibles todavía</b><span>La estructura de este módulo está preparada para recibir los eventos e integraciones correspondientes.</span></div>}</Panel></> }
 
 function Panel({ title, children, action }: { title: string; children: React.ReactNode; action?: React.ReactNode }) { return <section className="panel"><header><h2>{title}</h2>{typeof action === 'string' ? <button className="panel-action">{action}<ChevronDown size={14}/></button> : action}</header>{children}</section> }
-function Metric({ label, value }: { label:string; value:unknown }) { return <article className="kpi"><p>{label}</p><strong>{formatNumber(value)}</strong><small>Datos agregados</small></article> }
+function Metric({ label, value }: { label:string; value:unknown }) { const numeric = Number(value); const rendered = typeof value === 'string' && !Number.isFinite(numeric) ? value : formatNumber(value); return <article className="kpi"><p>{label}</p><strong>{rendered}</strong><small>Datos agregados</small></article> }
 function Timeline({ rows }: { rows: JsonRecord[] }) { return <div className="timeline">{rows.length?rows.slice(0,5).map((row)=><div key={String(row.id)}><i/><div><b>{String(row.title || row.message || 'Actividad de plataforma')}</b><small>{dateTime(row.at || row.createdAt)}</small></div></div>):<div className="empty-state"><Activity size={26}/><b>Sin actividad reciente</b></div>}</div> }
 function MiniChart() { const points = [{x:'L',value:32},{x:'M',value:41},{x:'X',value:37},{x:'J',value:52},{x:'V',value:61},{x:'S',value:58},{x:'D',value:73}]; return <div className="chart-wrap"><ResponsiveContainer width="100%" height={190}><LineChart data={points}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="x"/><YAxis hide/><Tooltip/><Line type="monotone" dataKey="value" stroke="#f97316" strokeWidth={2} dot={false}/></LineChart></ResponsiveContainer></div> }
 function UserGrowthChart({ data }: { data: JsonRecord[] }) { const formatDate = (value: unknown) => new Intl.DateTimeFormat('es-ES', { day: '2-digit', month: 'short' }).format(new Date(String(value))); return <div className="chart-wrap"><ResponsiveContainer width="100%" height={190}><LineChart data={data}><CartesianGrid strokeDasharray="3 3"/><XAxis dataKey="date" tickFormatter={formatDate} minTickGap={26}/><YAxis hide domain={['dataMin - 1', 'dataMax + 1']}/><Tooltip labelFormatter={formatDate} formatter={(value) => [formatNumber(value), 'Usuarios']}/><Line type="monotone" dataKey="users" stroke="#f97316" strokeWidth={2} dot={false} activeDot={{ r: 4 }}/></LineChart></ResponsiveContainer></div> }
-function DataTable({ rows, columns, action }: { rows: JsonRecord[]; columns: [string,string][]; action?: (row: JsonRecord)=>React.ReactNode }) { return <div className="table-wrap"><table><thead><tr>{columns.map(([,label])=><th key={label}>{label}</th>)}{action&&<th>Acciones</th>}</tr></thead><tbody>{rows.length?rows.map((row,index)=><tr key={String(row.id || index)}>{columns.map(([key])=><td key={key}>{renderCell(row[key],key)}</td>)}{action&&<td>{action(row)}</td>}</tr>):<tr><td colSpan={columns.length+(action?1:0)} className="no-results">No hay datos para estos filtros.</td></tr>}</tbody></table></div> }
+function DataTable({ rows, columns, action }: { rows: JsonRecord[] | null | undefined; columns: [string,string][]; action?: (row: JsonRecord)=>React.ReactNode }) { const safeRows = Array.isArray(rows) ? rows : []; return <div className="table-wrap"><table><thead><tr>{columns.map(([,label])=><th key={label}>{label}</th>)}{action&&<th>Acciones</th>}</tr></thead><tbody>{safeRows.length?safeRows.map((row,index)=><tr key={String(row.id || index)}>{columns.map(([key])=><td key={key}>{renderCell(row[key],key)}</td>)}{action&&<td>{action(row)}</td>}</tr>):<tr><td colSpan={columns.length+(action?1:0)} className="no-results">No hay datos para estos filtros.</td></tr>}</tbody></table></div> }
 function moderationStatusLabel(status: string) { return ({ pending: 'Pendiente', reviewing: 'En revisión', removed: 'Contenido retirado', dismissed: 'Descartado' } as Record<string, string>)[status] || status.replaceAll('_', ' ') }
 function renderCell(value: unknown, key: string) { if(value===null||value===undefined||value==='')return <span className="muted">—</span>; if(typeof value==='boolean')return <span className={`badge ${value?'success':'neutral'}`}>{value?'Activo':'No'}</span>; const dateKeys=new Set(['at','createdAt','updatedAt','publishedAt','joinedAt','reviewedAt','created_at','updated_at','published_at','joined_at','reviewed_at','deleted_at']); if(dateKeys.has(key)) return <span>{dateTime(value)}</span>; if(key==='status')return <span className="badge">{moderationStatusLabel(String(value))}</span>; if(key==='type'||key==='priority'||key==='language'||key==='locale')return <span className="badge">{String(value).replaceAll('_',' ')}</span>; if(typeof value==='object') return <span className="muted">Configurado</span>; return <span title={String(value)}>{String(value).length>46?`${String(value).slice(0,46)}…`:String(value)}</span> }
 function autoColumns(rows: JsonRecord[]): [string,string][] { const first=rows[0]||{}; return Object.keys(first).slice(0,6).map((key)=>[key,key.replace(/([A-Z])/g,' $1').replace(/^./,(x)=>x.toUpperCase())]) }

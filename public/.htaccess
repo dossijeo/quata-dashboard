@@ -1,0 +1,10 @@
+Options -MultiViews
+RewriteEngine On
+
+# Vite/React SPA: let Apache serve existing files and folders, and route the
+# remaining client-side paths through the application entry point.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+RewriteRule ^ index.html [L]

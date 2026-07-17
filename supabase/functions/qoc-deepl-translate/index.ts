@@ -35,10 +35,20 @@ Deno.serve(async (request) => {
   if (!apiKey) return Response.json({ error: 'translation_not_configured' }, { status: 503, headers: corsHeaders })
   const form = new URLSearchParams({ source_lang: sourceLanguage, target_lang: targetLanguage, tag_handling: 'html' })
   texts.forEach((text: string) => form.append('text', text))
+  const startedAt = performance.now()
   const response = await fetch('https://api-free.deepl.com/v2/translate', {
     method: 'POST', headers: { Authorization: `DeepL-Auth-Key ${apiKey}`, 'content-type': 'application/x-www-form-urlencoded' }, body: form,
   })
+  const latencyMs = Math.round(performance.now() - startedAt)
   const payload = await response.json().catch(() => ({}))
+  const admin = createClient(Deno.env.get('SUPABASE_URL') ?? '', Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '')
+  await admin.from('qoc_service_checks').insert({
+    service_key: 'deepl',
+    status: response.ok ? 'operational' : 'attention',
+    latency_ms: latencyMs,
+    status_code: response.status,
+    detail: response.ok ? 'Última traducción real completada correctamente.' : `La última traducción real recibió el estado ${response.status}.`,
+  }).then(() => undefined).catch(() => undefined)
   if (!response.ok) return Response.json({ error: 'translation_failed' }, { status: 502, headers: corsHeaders })
   return Response.json({ translations: (payload.translations || []).map((item: { text?: string }) => item.text || '') }, { headers: corsHeaders })
 })
