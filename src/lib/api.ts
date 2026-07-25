@@ -1,4 +1,4 @@
-import { AUTH_BRIDGE_URL, QOC_ACCOUNT_URL, supabase } from './supabase'
+import { ACCOUNT_LIFECYCLE_URL, AUTH_BRIDGE_URL, QOC_ACCOUNT_URL, supabase } from './supabase'
 
 export type QocSession = {
   profile: { id: string; displayName: string; avatarUrl?: string | null; territory?: string | null; isAdmin: boolean; isOfficial: boolean }
@@ -56,6 +56,34 @@ export async function uploadMyAccountAvatar(file: File): Promise<QocAccount> {
   form.set('file', file)
   const payload = await invokeAccount(form)
   return payload.profile as QocAccount
+}
+
+export async function manageUserAccount(
+  action: 'deactivate' | 'reactivate' | 'delete',
+  targetProfileId: string,
+): Promise<Record<string, unknown>> {
+  const { data } = await supabase.auth.getSession()
+  if (!data.session?.access_token) throw new Error('Tu sesión ha caducado. Vuelve a iniciar sesión.')
+  const response = await fetch(ACCOUNT_LIFECYCLE_URL, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${data.session.access_token}`,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({ action, target_profile_id: targetProfileId }),
+  })
+  const payload = await response.json().catch(() => ({})) as Record<string, unknown>
+  if (!response.ok) {
+    const code = String(payload.error || '')
+    const message = ({
+      administrator_required: 'No tienes permisos para gestionar esta cuenta.',
+      profile_not_found: 'La cuenta ya no existe.',
+      target_auth_user_not_found: 'No se ha podido localizar la identidad de acceso de esta cuenta.',
+      account_operation_failed: 'No se ha podido completar la operación sobre la cuenta.',
+    } as Record<string, string>)[code] || 'No se ha podido completar la operación sobre la cuenta.'
+    throw new Error(message)
+  }
+  return payload
 }
 
 export async function signInWithQuata(phone: string, countryCode: string, password: string) {
@@ -134,6 +162,151 @@ export async function getAuditEvents(query: string, action: string, entityType: 
     p_entity_type: entityType,
     p_page: page,
     p_page_size: pageSize,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCitizenSecurityConfig(): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_config')
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function searchCitizenSecurityUsers(query: string, page = 1, reason = ''): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_search', {
+    p_query: query,
+    p_page: page,
+    p_page_size: 20,
+    p_reason: reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function openCitizenSecurityProfile(targetUserId: string, reason = ''): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_open_profile', {
+    p_target_user_id: targetUserId,
+    p_reason: reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCitizenSecurityConversations(
+  targetUserId: string,
+  options: { type?: string; participantQuery?: string; hasAttachments?: boolean | null; hasLocation?: boolean | null; dateFrom?: string; dateTo?: string; page?: number; reason?: string } = {},
+): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_conversations', {
+    p_target_user_id: targetUserId,
+    p_type: options.type || 'ALL',
+    p_participant_query: options.participantQuery || null,
+    p_has_attachments: options.hasAttachments ?? null,
+    p_has_location: options.hasLocation ?? null,
+    p_date_from: options.dateFrom || null,
+    p_date_to: options.dateTo || null,
+    p_page: options.page || 1,
+    p_page_size: 30,
+    p_reason: options.reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCitizenSecurityConversation(
+  targetUserId: string,
+  conversationId: number | string,
+  options: { query?: string; dateFrom?: string; dateTo?: string; authorMode?: string; hasAttachment?: boolean | null; page?: number; reason?: string } = {},
+): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_conversation', {
+    p_target_user_id: targetUserId,
+    p_conversation_id: Number(conversationId),
+    p_query: options.query || null,
+    p_date_from: options.dateFrom || null,
+    p_date_to: options.dateTo || null,
+    p_author_mode: options.authorMode || 'ANY',
+    p_has_attachment: options.hasAttachment ?? null,
+    p_page: options.page || 1,
+    p_page_size: 50,
+    p_reason: options.reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCitizenSecurityTimeline(
+  targetUserId: string,
+  options: { onlyCoordinates?: boolean; sources?: string[]; dateFrom?: string; dateTo?: string; reason?: string } = {},
+): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_location_timeline', {
+    p_target_user_id: targetUserId,
+    p_sources: options.sources?.length ? options.sources : null,
+    p_only_coordinates: options.onlyCoordinates || false,
+    p_date_from: options.dateFrom || null,
+    p_date_to: options.dateTo || null,
+    p_reason: options.reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function resolveCitizenSecurityLocations(
+  targetUserId: string,
+  evidenceIds: string[],
+  reason = '',
+): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.functions.invoke('qoc-citizen-geocode', {
+    body: {
+      targetUserId,
+      evidenceIds: evidenceIds.slice(0, 30),
+      reason: reason || null,
+    },
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCitizenSecurityMedia(
+  targetUserId: string,
+  options: { origin?: string; mediaKind?: string; dateFrom?: string; dateTo?: string; page?: number; reason?: string } = {},
+): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_media', {
+    p_target_user_id: targetUserId,
+    p_origin: options.origin || 'ALL',
+    p_media_kind: options.mediaKind || 'ALL',
+    p_date_from: options.dateFrom || null,
+    p_date_to: options.dateTo || null,
+    p_page: options.page || 1,
+    p_page_size: 24,
+    p_reason: options.reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function openCitizenSecurityMedia(targetUserId: string, mediaId: string, reason = ''): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_open_media', {
+    p_target_user_id: targetUserId,
+    p_media_id: mediaId,
+    p_reason: reason || null,
+  })
+  if (error) throw error
+  return data as Record<string, unknown>
+}
+
+export async function getCitizenSecurityAudit(
+  targetUserId: string | null,
+  options: { page?: number; action?: string; personQuery?: string; dateFrom?: string; dateTo?: string; reason?: string } = {},
+): Promise<Record<string, unknown>> {
+  const { data, error } = await supabase.rpc('qoc_citizen_security_audit', {
+    p_target_user_id: targetUserId,
+    p_action: options.action || null,
+    p_person_query: options.personQuery || null,
+    p_date_from: options.dateFrom || null,
+    p_date_to: options.dateTo || null,
+    p_page: options.page || 1,
+    p_page_size: 25,
+    p_reason: options.reason || null,
   })
   if (error) throw error
   return data as Record<string, unknown>

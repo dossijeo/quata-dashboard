@@ -7,13 +7,14 @@ import {
   Activity, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Command, ExternalLink, Eye, FilePlus2,
   Bold, Globe2, Heart, Image, Info, Italic, Languages, Link, List, LogOut, Map, Menu, MessageCircle, Moon, MoreHorizontal, Play, Plus, RefreshCw, Search, Share2, Sun, Trash2, Underline, Upload, Video, X, Zap,
 } from 'lucide-react'
-import { createOfficialPostVariants, decideModerationReport, deleteOfficialPostGroup, getAnalytics, getAuditEvents, getCommunities, getComplianceOverview, getExecutiveOverview, getGooglePlayOverview, getMediaLibrary, getModerationFullContent, getModerationReportDetail, getModerationReports, getModuleData, getMonitoring, getMyAccount, getOfficialPosts, getOfficialProfiles, getPasswordRecoveryQuestion, getQocSession, getSosAlerts, getSosThreadMessages, getTerritories, getUserGrowthSeries, qocCommand, QocAccount, QocSession, resetPasswordWithSecretAnswer, runMonitoringProbe, signInWithQuata, signOutFromQoc, translateOfficialTexts, updateMyAccount, uploadMyAccountAvatar, uploadOfficialMedia } from './lib/api'
+import { createOfficialPostVariants, decideModerationReport, deleteOfficialPostGroup, getAnalytics, getAuditEvents, getCommunities, getComplianceOverview, getExecutiveOverview, getGooglePlayOverview, getMediaLibrary, getModerationFullContent, getModerationReportDetail, getModerationReports, getModuleData, getMonitoring, getMyAccount, getOfficialPosts, getOfficialProfiles, getPasswordRecoveryQuestion, getQocSession, getSosAlerts, getSosThreadMessages, getTerritories, getUserGrowthSeries, manageUserAccount, qocCommand, QocAccount, QocSession, resetPasswordWithSecretAnswer, runMonitoringProbe, signInWithQuata, signOutFromQoc, translateOfficialTexts, updateMyAccount, uploadMyAccountAvatar, uploadOfficialMedia } from './lib/api'
 import { moduleBySlug, modules, ModuleMeta } from './lib/catalog'
 import { countryPrefixes } from './lib/country-prefixes'
 import { supabase } from './lib/supabase'
 import { RichBlockEditor } from './components/RichBlockEditor'
 import { OfficialMediaEditor } from './components/OfficialMediaEditor'
 import { AvatarImageEditor } from './components/AvatarImageEditor'
+import { CitizenSecurityModule } from './components/CitizenSecurityModule'
 
 type JsonRecord = Record<string, unknown>
 const formatNumber = (value: unknown) => new Intl.NumberFormat('es-ES').format(Number(value || 0))
@@ -354,6 +355,7 @@ const SirenIcon = () => <Zap size={16}/>
 function ModuleContent({ meta, data, session, refresh, refreshKey }: { meta: ModuleMeta; data: unknown; session: QocSession; refresh: () => void; refreshKey: number }) {
   if (meta.slug === 'dashboard') return <ExecutiveOverview refreshKey={refreshKey} />
   if (meta.slug === 'sos') return <SosModule data={data as JsonRecord[]} mapOnly={false} />
+  if (meta.slug === 'seguridad-ciudadana') return <CitizenSecurityModule />
   if (meta.slug === 'territorios') return <CommunitiesModule />
   if (meta.slug === 'moderacion') return <Moderation data={data as JsonRecord[]} refresh={refresh} />
   if (meta.slug === 'usuarios' || meta.slug === 'editor-oficial') return <OfficialModule data={data as JsonRecord} editor={meta.slug === 'editor-oficial'} refresh={refresh} session={session} />
@@ -952,6 +954,8 @@ function OfficialModule({ data, editor, refresh, session }: { data: JsonRecord |
   return <OfficialDirectory refresh={refresh}/>
 }
 
+type AccountLifecycleAction = 'deactivate' | 'reactivate' | 'delete'
+
 function OfficialDirectory({ refresh }: { refresh: () => void }) {
   const [profileQuery, setProfileQuery] = useState('')
   const [territory, setTerritory] = useState(() => new URLSearchParams(window.location.search).get('barrio') || 'all')
@@ -963,16 +967,53 @@ function OfficialDirectory({ refresh }: { refresh: () => void }) {
   const [profileReload, setProfileReload] = useState(0)
   const [selectedProfile, setSelectedProfile] = useState<JsonRecord | null>(null)
   const [roleBusy, setRoleBusy] = useState<string | null>(null)
+  const [lifecycleBusy, setLifecycleBusy] = useState<AccountLifecycleAction | null>(null)
+  const [pendingLifecycle, setPendingLifecycle] = useState<{ action: AccountLifecycleAction; profile: JsonRecord } | null>(null)
+  const [toast, setToast] = useState('')
   useEffect(() => { let active = true; const timer = window.setTimeout(() => { setProfilesLoading(true); setProfilesError(''); getOfficialProfiles(profileQuery, territory, accountType, profilePage).then((value) => { if (active) setProfileResult(value as JsonRecord) }).catch(() => { if (active) setProfilesError('No se ha podido cargar el directorio de cuentas.') }).finally(() => { if (active) setProfilesLoading(false) }) }, 160); return () => { active = false; window.clearTimeout(timer) } }, [profileQuery, territory, accountType, profilePage, profileReload])
+  useEffect(() => {
+    if (!toast) return
+    const timer = window.setTimeout(() => setToast(''), 4200)
+    return () => window.clearTimeout(timer)
+  }, [toast])
   const updateProfileFilter = (setter: (value: string) => void, value: string) => { setter(value); setProfilePage(1) }
   const toggleRole = async (profile: JsonRecord, field: 'isAdmin'|'isOfficial') => { setRoleBusy(`${profile.id}:${field}`); try { const result = await qocCommand<JsonRecord>('user.role.toggle', { profileId: profile.id, [field]: !Boolean(profile[field]), reason: `Cambio ${field} desde QOC` }); setSelectedProfile((current) => current && String(current.id) === String(profile.id) ? { ...current, isAdmin: result.is_admin, isOfficial: result.is_official } : current); setProfileReload((current) => current + 1); refresh() } finally { setRoleBusy(null) } }
+  const runLifecycle = async () => {
+    if (!pendingLifecycle) return
+    const { action, profile } = pendingLifecycle
+    setLifecycleBusy(action)
+    try {
+      await manageUserAccount(action, String(profile.id))
+      setPendingLifecycle(null)
+      if (action === 'delete') {
+        setSelectedProfile(null)
+        setToast(`${String(profile.name)} se ha eliminado completamente del sistema.`)
+      } else {
+        const accountStatus = action === 'deactivate' ? 'deactivated' : 'active'
+        setSelectedProfile((current) => current && String(current.id) === String(profile.id)
+          ? { ...current, accountStatus, deactivatedAt: action === 'deactivate' ? new Date().toISOString() : null }
+          : current)
+        setToast(action === 'deactivate'
+          ? `La cuenta de ${String(profile.name)} se ha desactivado.`
+          : `La cuenta de ${String(profile.name)} se ha reactivado.`)
+      }
+      setProfileReload((current) => current + 1)
+      refresh()
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : 'No se ha podido completar la operación.')
+    } finally {
+      setLifecycleBusy(null)
+    }
+  }
   const profiles = (profileResult.items || []) as JsonRecord[]; const territories = (profileResult.territories || []) as string[]; const profileTotal = Number(profileResult.total || 0); const profilePageSize = Number(profileResult.pageSize || 20); const profilePages = Math.max(1, Math.ceil(profileTotal / profilePageSize))
   /* Legacy inline view retained temporarily below while the directory layout is split into readable pieces.
   return <><div className="section-tabs" role="tablist"><button className={tab === 'profiles' ? 'active' : ''} onClick={() => setTab('profiles')}>Perfiles</button><button className={tab === 'posts' ? 'active' : ''} onClick={() => setTab('posts')}>Publicaciones oficiales</button></div>{tab === 'profiles' ? <><div className="territory-toolbar"><label className="territory-search"><Search size={16}/><input value={profileQuery} onChange={(event) => updateProfileFilter(setProfileQuery, event.target.value)} placeholder="Buscar por nombre o barrio"/></label><label>Barrio<select value={territory} onChange={(event) => updateProfileFilter(setTerritory, event.target.value)}><option value="all">Todos</option>{territories.map((item) => <option key={item} value={item}>{item}</option>)}</select></label><label>Tipo de cuenta<select value={accountType} onChange={(event) => updateProfileFilter(setAccountType, event.target.value)}><option value="all">Todas</option><option value="official">Oficiales</option><option value="admin">Administradores</option><option value="official_admin">Oficiales y administradores</option><option value="standard">Estándar</option></select></label></div><Panel title="Directorio de cuentas" action={`${profileTotal} perfiles`}>{profilesError ? <div className="territory-error"><CircleAlert size={18}/><span>{profilesError}</span><button className="secondary" onClick={() => setProfileReload((current) => current + 1)}>Reintentar</button></div> : profilesLoading ? <div className="territory-loading"><span className="spinner"/>Actualizando perfiles…</div> : <><div className="official-account-grid">{profiles.map((profile) => <article className="official-account-card" key={String(profile.id)}><div className="official-account-avatar">{profile.avatarUrl ? <img src={String(profile.avatarUrl)} alt=""/> : initials(String(profile.name))}</div><div className="official-account-copy"><h3>{String(profile.name)}{Boolean(profile.isOfficial) && <span className="verified-dot">✓</span>}</h3><p>{String(profile.territory)}</p><div>{Boolean(profile.isOfficial) && <span className="badge official">Oficial</span>}{Boolean(profile.isAdmin) && <span className="badge success">Admin</span>}{!Boolean(profile.isOfficial) && !Boolean(profile.isAdmin) && <span className="badge neutral">Cuenta estándar</span>}</div></div><button className="icon official-more" onClick={() => setSelectedProfile(profile)} title="Ver perfil"><MoreHorizontal size={20}/></button></article>)}</div><DirectoryPagination page={profilePage} total={profileTotal} pageSize={profilePageSize} pages={profilePages} onPage={setProfilePage}/></>}</Panel></> : <><div className="territory-toolbar"><label className="territory-search"><Search size={16}/><input value={postQuery} onChange={(event) => updatePostFilter(setPostQuery, event.target.value)} placeholder="Buscar por título, cuenta o resumen"/></label><label>Estado<select value={postStatus} onChange={(event) => updatePostFilter(setPostStatus, event.target.value)}><option value="all">Todos</option><option value="published">Publicadas</option><option value="draft">Borradores</option><option value="deleted">Eliminadas</option></select></label><label>Tipo<select value={postType} onChange={(event) => updatePostFilter(setPostType, event.target.value)}><option value="all">Todos</option><option value="announcement">Comunicado</option><option value="news">Noticia</option><option value="event">Evento</option><option value="urgent">Alerta</option></select></label></div><Panel title="Publicaciones oficiales" action={`${postTotal} publicaciones`}>{postsError ? <div className="territory-error"><CircleAlert size={18}/><span>{postsError}</span><button className="secondary" onClick={() => setPostReload((current) => current + 1)}>Reintentar</button></div> : postsLoading ? <div className="territory-loading"><span className="spinner"/>Actualizando publicaciones…</div> : <><div className="official-post-list">{posts.map((post) => <button className="official-post-row" key={String(post.id)} onClick={() => setSelectedPost(post)}><span className={`official-post-status ${String(post.status)}`}/><div><b>{String(post.title || 'Publicación sin título')}</b><small>{String(post.author)} · {officialPostTypeLabel(String(post.type))} · {dateTime(post.publishedAt)}</small></div><span className="badge">{officialPostStatusLabel(String(post.status))}</span><ChevronRight size={18}/></button>)}</div><DirectoryPagination page={postPage} total={postTotal} pageSize={postPageSize} pages={postPages} onPage={setPostPage}/></>}</Panel></>}</>{selectedProfile && <OfficialProfileModal profile={selectedProfile} busy={roleBusy} onToggle={toggleRole} close={() => setSelectedProfile(null)}/>} {selectedPost && <OfficialPostPreviewModal post={selectedPost} close={() => setSelectedPost(null)}/>}</>
 */
   return <>
     <OfficialProfilesDirectory query={profileQuery} territory={territory} accountType={accountType} territories={territories} profiles={profiles} total={profileTotal} page={profilePage} pageSize={profilePageSize} pages={profilePages} loading={profilesLoading} error={profilesError} onQuery={(value) => updateProfileFilter(setProfileQuery, value)} onTerritory={(value) => updateProfileFilter(setTerritory, value)} onType={(value) => updateProfileFilter(setAccountType, value)} onPage={setProfilePage} onRetry={() => setProfileReload((current) => current + 1)} onSelect={setSelectedProfile}/>
-    {selectedProfile && <OfficialProfileModal profile={selectedProfile} busy={roleBusy} onToggle={toggleRole} close={() => setSelectedProfile(null)}/>} 
+    {selectedProfile && <OfficialProfileModal profile={selectedProfile} roleBusy={roleBusy} lifecycleBusy={lifecycleBusy} onToggle={toggleRole} onLifecycle={(action) => setPendingLifecycle({ action, profile: selectedProfile })} close={() => setSelectedProfile(null)}/>}
+    {pendingLifecycle && <AccountLifecycleConfirm action={pendingLifecycle.action} profile={pendingLifecycle.profile} busy={lifecycleBusy !== null} confirm={runLifecycle} close={() => setPendingLifecycle(null)}/>}
+    {toast && <div className={`qoc-toast ${toast.includes('No se ha podido') ? 'error' : ''}`} role="status">{toast}</div>}
   </>
 }
 
@@ -1070,7 +1111,104 @@ function OfficialPostsDirectory({ query, status, type, language, posts, total, p
 
 function DirectoryPagination({ page, total, pageSize, pages, onPage }: { page: number; total: number; pageSize: number; pages: number; onPage: (page: number) => void }) { return <div className="territory-pagination"><span>Mostrando {total ? (page - 1) * pageSize + 1 : 0}–{Math.min(page * pageSize, total)} de {total}</span><div><button className="icon" disabled={page === 1} onClick={() => onPage(Math.max(1, page - 1))} title="Página anterior"><ChevronLeft size={18}/></button><b>Página {page} de {pages}</b><button className="icon" disabled={page >= pages} onClick={() => onPage(Math.min(pages, page + 1))} title="Página siguiente"><ChevronRight size={18}/></button></div></div> }
 
-function OfficialProfileModal({ profile, busy, onToggle, close }: { profile: JsonRecord; busy: string | null; onToggle: (profile: JsonRecord, field: 'isAdmin'|'isOfficial') => void; close: () => void }) { const avatar = profile.avatarUrl ? <img src={String(profile.avatarUrl)} alt=""/> : initials(String(profile.name)); return <Modal title="Perfil de cuenta" close={close}><div className="official-profile-detail"><header><div className="official-profile-avatar">{avatar}</div><div><h3>{String(profile.name)}{Boolean(profile.isOfficial) && <span className="verified-dot">✓</span>}</h3><p>{String(profile.territory)}</p></div></header><dl><div><dt>Seguidores</dt><dd>{formatNumber(profile.followers)}</dd></div><div><dt>Siguiendo</dt><dd>{formatNumber(profile.following)}</dd></div><div><dt>Registro</dt><dd>{dateTime(profile.joinedAt)}</dd></div><div><dt>Último acceso</dt><dd>{dateTime(profile.lastLoginAt)}</dd></div></dl><div className="role-switches"><label><span><b>Cuenta oficial</b><small>Muestra el distintivo verificado y permite publicar en el muro oficial.</small></span><input type="checkbox" checked={Boolean(profile.isOfficial)} disabled={busy === `${profile.id}:isOfficial`} onChange={() => onToggle(profile, 'isOfficial')}/><i/></label><label><span><b>Administrador</b><small>Concede acceso operativo y capacidad de gestión de roles.</small></span><input type="checkbox" checked={Boolean(profile.isAdmin)} disabled={busy === `${profile.id}:isAdmin`} onChange={() => onToggle(profile, 'isAdmin')}/><i/></label></div></div></Modal> }
+function OfficialProfileModal({
+  profile, roleBusy, lifecycleBusy, onToggle, onLifecycle, close,
+}: {
+  profile: JsonRecord
+  roleBusy: string | null
+  lifecycleBusy: AccountLifecycleAction | null
+  onToggle: (profile: JsonRecord, field: 'isAdmin'|'isOfficial') => void
+  onLifecycle: (action: AccountLifecycleAction) => void
+  close: () => void
+}) {
+  const avatar = profile.avatarUrl ? <img src={String(profile.avatarUrl)} alt=""/> : initials(String(profile.name))
+  const isDeactivated = String(profile.accountStatus || 'active') === 'deactivated'
+  const disabled = lifecycleBusy !== null
+  return <Modal title="Perfil de cuenta" close={close}>
+    <div className="official-profile-detail">
+      <header>
+        <div className="official-profile-avatar">{avatar}</div>
+        <div>
+          <h3>{String(profile.name)}{Boolean(profile.isOfficial) && <span className="verified-dot">✓</span>}</h3>
+          <p>{String(profile.territory)}</p>
+          <span className={`account-state ${isDeactivated ? 'deactivated' : 'active'}`}>{isDeactivated ? 'Cuenta desactivada' : 'Cuenta activa'}</span>
+        </div>
+      </header>
+      <dl>
+        <div><dt>Seguidores</dt><dd>{formatNumber(profile.followers)}</dd></div>
+        <div><dt>Siguiendo</dt><dd>{formatNumber(profile.following)}</dd></div>
+        <div><dt>Registro</dt><dd>{dateTime(profile.joinedAt)}</dd></div>
+        <div><dt>Último acceso</dt><dd>{dateTime(profile.lastLoginAt)}</dd></div>
+      </dl>
+      <div className="role-switches">
+        <label>
+          <span><b>Cuenta oficial</b><small>Muestra el distintivo verificado y permite publicar en el muro oficial.</small></span>
+          <input type="checkbox" checked={Boolean(profile.isOfficial)} disabled={disabled || isDeactivated || roleBusy === `${profile.id}:isOfficial`} onChange={() => onToggle(profile, 'isOfficial')}/><i/>
+        </label>
+        <label>
+          <span><b>Administrador</b><small>Concede acceso operativo y capacidad de gestión de roles.</small></span>
+          <input type="checkbox" checked={Boolean(profile.isAdmin)} disabled={disabled || isDeactivated || roleBusy === `${profile.id}:isAdmin`} onChange={() => onToggle(profile, 'isAdmin')}/><i/>
+        </label>
+      </div>
+      <div className="account-lifecycle-actions">
+        <div>
+          <b>Gestión de la cuenta</b>
+          <small>Controla el acceso o elimina permanentemente todos los datos del usuario.</small>
+        </div>
+        <div>
+          <button className={isDeactivated ? 'primary' : 'secondary'} disabled={disabled} onClick={() => onLifecycle(isDeactivated ? 'reactivate' : 'deactivate')}>
+            {lifecycleBusy === (isDeactivated ? 'reactivate' : 'deactivate') ? 'Procesando…' : isDeactivated ? 'Reactivar cuenta' : 'Desactivar cuenta'}
+          </button>
+          <button className="danger" disabled={disabled} onClick={() => onLifecycle('delete')}>
+            <Trash2 size={16}/>{lifecycleBusy === 'delete' ? 'Eliminando…' : 'Eliminar cuenta'}
+          </button>
+        </div>
+      </div>
+    </div>
+  </Modal>
+}
+
+function AccountLifecycleConfirm({
+  action, profile, busy, confirm, close,
+}: {
+  action: AccountLifecycleAction
+  profile: JsonRecord
+  busy: boolean
+  confirm: () => void
+  close: () => void
+}) {
+  const name = String(profile.name || 'esta cuenta')
+  const content = action === 'delete'
+    ? {
+        title: 'Eliminar cuenta definitivamente',
+        text: `Vas a eliminar a ${name} y todos sus datos, publicaciones, conversaciones privadas y archivos asociados. Esta acción no se puede deshacer.`,
+        button: 'Eliminar definitivamente',
+      }
+    : action === 'deactivate'
+      ? {
+          title: 'Desactivar cuenta',
+          text: `${name} perderá el acceso a Qüata y se cerrarán sus sesiones. Sus datos se conservarán para poder reactivar la cuenta más adelante.`,
+          button: 'Desactivar cuenta',
+        }
+      : {
+          title: 'Reactivar cuenta',
+          text: `${name} recuperará el acceso a Qüata con su identidad y sus datos anteriores.`,
+          button: 'Reactivar cuenta',
+        }
+  return <Modal title={content.title} close={close}>
+    <div className="account-lifecycle-confirm">
+      <CircleAlert size={28}/>
+      <p>{content.text}</p>
+      {action === 'delete' && <strong>La eliminación es irreversible.</strong>}
+      <div className="form-actions">
+        <button className="secondary" disabled={busy} onClick={close}>Cancelar</button>
+        <button className={action === 'delete' ? 'danger' : 'primary'} disabled={busy} onClick={confirm}>
+          {busy ? 'Procesando…' : content.button}
+        </button>
+      </div>
+    </div>
+  </Modal>
+}
 
 function officialPostTypeLabel(type: string) { return ({ announcement: 'Comunicado', news: 'Noticia', event: 'Evento', urgent: 'Alerta' } as Record<string, string>)[type] || type }
 function officialPostStatusLabel(status: string) { return ({ published: 'Publicada', deleted: 'Eliminada' } as Record<string, string>)[status] || status }

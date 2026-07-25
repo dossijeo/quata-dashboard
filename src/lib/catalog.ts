@@ -1,7 +1,7 @@
 import type { LucideIcon } from 'lucide-react'
 import {
   Activity, BookOpenCheck, ChartNoAxesCombined, CircleHelp,
-  FileBarChart, Gauge, LayoutDashboard, MessageSquareWarning,
+  FileBarChart, Gauge, LayoutDashboard, MessageSquareWarning, ScanSearch,
   MonitorCog, Network, Scale, ShieldAlert, ShieldCheck, Siren,
   UsersRound, Workflow,
 } from 'lucide-react'
@@ -11,6 +11,7 @@ export type ModuleMeta = { slug: string; label: string; description: string; sou
 export const modules: ModuleMeta[] = [
   { slug: 'dashboard', label: 'Resumen ejecutivo', description: 'Situación, actividad y prioridades', source: '06_Dashboard_ejecutivo.md', group: 'Operaciones', icon: LayoutDashboard },
   { slug: 'sos', label: 'Centro SOS', description: 'Alertas, asignación y respuesta', source: '07_Centro_de_Control_SOS.md', group: 'Operaciones', icon: Siren, dataKey: 'sos' },
+  { slug: 'seguridad-ciudadana', label: 'Seguridad ciudadana', description: 'Consultas históricas con acceso auditado', source: 'Especificación técnica de Seguridad ciudadana', group: 'Operaciones', icon: ScanSearch },
   { slug: 'territorios', label: 'Gestión territorial', description: 'Barrios, comunidades, actividad y miembros', source: '15_Gestion_de_comunidades_y_barrios.md', group: 'Operaciones', icon: Network },
   { slug: 'moderacion', label: 'Moderación', description: 'Reportes y decisiones de contenido', source: '11_Moderacion_y_reportes.md', group: 'Contenido', icon: ShieldAlert, dataKey: 'moderation' },
   { slug: 'usuarios', label: 'Usuarios y acceso', description: 'Perfiles, roles y permisos de plataforma', source: '12_Cuentas_oficiales_y_roles_institucionales.md', group: 'Operaciones', icon: UsersRound, dataKey: 'official' },

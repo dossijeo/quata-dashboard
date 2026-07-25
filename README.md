@@ -17,6 +17,13 @@ Panel web interno para la operación, moderación y gestión editorial de Qüata
 - **Resumen ejecutivo** con indicadores compactos de SOS, moderación, actividad, usuarios, contenido, servicios, versiones y seguridad; cada bloque enlaza a su sección operativa.
 - **Centro SOS** basado en los mensajes SOS reales de las conversaciones de chat: histórico de las últimas 50 alertas, estados activos, agrupación geográfica, mapa navegable, zoom contextual, detalle individual, enlace a Google Maps y lectura del hilo completo.
 - El visor de hilos SOS interpreta los shortcodes de emergencia y permite abrir adjuntos de imagen, vídeo, audio y documentos.
+- **Seguridad ciudadana** para consultas históricas controladas de perfiles, comunicaciones y evidencias de ubicación:
+  - Búsqueda mínima y datos identificativos progresivos, sin exponer el directorio completo.
+  - Historial de chats por destinatarios y fechas, mensajes paginados hacia atrás y visor auditado de adjuntos.
+  - Cronología cartográfica de evidencias con fechas, fuentes, precisión, diferenciación entre puntos aportados y coincidencias geográficas aproximadas.
+  - Galería multimedia con filtros por origen, tipo y fecha, y previsualización integrada tras registrar el acceso.
+  - Auditoría inmutable global y por perfil, paginada y filtrable por persona, acción y rango temporal.
+- Cada lectura sensible de Seguridad ciudadana se autoriza y registra en Supabase antes de devolver datos. El acceso directo permanece aislado tras una bandera de demostración y permisos QOC específicos.
 - **Gestión territorial** con comunidades y barrios, búsqueda, filtros, paginación y acceso directo a los usuarios de cada barrio.
 - **Usuarios y acceso** con búsqueda, filtros territoriales y por tipo de cuenta, orden de perfiles verificados, métricas reales de seguidores/siguiendo y controles de administrador/cuenta oficial para operadores autorizados.
 

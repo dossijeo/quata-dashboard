@@ -7,6 +7,15 @@ const corsHeaders = {
 }
 
 type ServiceAccount = { client_email: string; private_key: string; token_uri: string }
+type GoogleReleaseNote = { language?: string; text?: string }
+type GoogleTrackRelease = {
+  versionCodes?: string[]
+  status?: string
+  userFraction?: number
+  releaseNotes?: GoogleReleaseNote[]
+  name?: string
+}
+type GoogleTrack = { track?: string; releases?: GoogleTrackRelease[] }
 
 function base64Url(value: string) {
   return btoa(value).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '')
@@ -101,6 +110,76 @@ async function getTracks(token: string, packageName: string) {
   }
 }
 
+/**
+ * Android Publisher keeps only the releases currently exposed by a track. We
+ * retain every normalized production release in Supabase instead of deleting
+ * records that later disappear from the response. A multi-code Play release is
+ * represented once, with its largest version code as the client-facing code.
+ */
+async function archiveProductionReleases(
+  admin: ReturnType<typeof createClient>,
+  packageName: string,
+  tracksPayload: Record<string, unknown>,
+) {
+  const tracks = (tracksPayload.tracks || []) as GoogleTrack[]
+  const production = tracks.find((track) => track.track === 'production')
+  const releases = production?.releases || []
+  let archived = 0
+  let notesArchived = 0
+
+  for (const release of releases) {
+    const versionCodes = (release.versionCodes || [])
+      .map((value) => Number(value))
+      .filter((value) => Number.isSafeInteger(value) && value > 0)
+      .sort((left, right) => left - right)
+    if (versionCodes.length === 0) continue
+
+    const notes = (release.releaseNotes || [])
+      .map((note) => ({
+        languageTag: note.language?.trim(),
+        text: note.text?.trim(),
+      }))
+      .filter((note): note is { languageTag: string; text: string } => Boolean(note.languageTag && note.text))
+    const canonicalCode = versionCodes[versionCodes.length - 1]
+    const status = release.status || 'unknown'
+    const visible = notes.length > 0 && ['completed', 'inProgress', 'halted'].includes(status)
+    const { data: storedRelease, error: releaseError } = await admin
+      .from('android_releases')
+      .upsert({
+        package_name: packageName,
+        track: 'production',
+        version_code: canonicalCode,
+        version_codes: versionCodes,
+        version_name: release.name || null,
+        release_status: status,
+        rollout_fraction: typeof release.userFraction === 'number' ? release.userFraction : null,
+        last_synced_at: new Date().toISOString(),
+        visible_in_whats_new: visible,
+        language_count: notes.length,
+        source_payload: release,
+      }, { onConflict: 'package_name,track,version_code' })
+      .select('id')
+      .single()
+    if (releaseError) throw releaseError
+    archived += 1
+
+    if (storedRelease && notes.length > 0) {
+      const { error: notesError } = await admin
+        .from('android_release_notes')
+        .upsert(notes.map((note) => ({
+          release_id: storedRelease.id,
+          language_tag: note.languageTag,
+          note_text: note.text,
+          updated_at: new Date().toISOString(),
+        })), { onConflict: 'release_id,language_tag' })
+      if (notesError) throw notesError
+      notesArchived += notes.length
+    }
+  }
+
+  return { releases: archived, notes: notesArchived }
+}
+
 async function collectGooglePlayData() {
   const rawAccount = Deno.env.get('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_B64')
     ? atob(Deno.env.get('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON_B64') ?? '')
@@ -139,9 +218,14 @@ Deno.serve(async (request) => {
     try {
       const result = await collectGooglePlayData()
       const admin = createClient(supabaseUrl, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '')
-      const { error } = await admin.from('qoc_google_play_snapshots').insert({ package_name: result.packageName, payload: result.payload })
+      const trackPayload = { tracks: result.payload.tracks }
+      const archive = await archiveProductionReleases(admin, result.packageName, trackPayload)
+      const { error } = await admin.from('qoc_google_play_snapshots').insert({
+        package_name: result.packageName,
+        payload: { ...result.payload, releaseArchive: archive },
+      })
       if (error) throw error
-      return Response.json({ synced: true, refreshedAt: result.payload.refreshedAt }, { headers: corsHeaders })
+      return Response.json({ synced: true, refreshedAt: result.payload.refreshedAt, releaseArchive: archive }, { headers: corsHeaders })
     } catch (error) {
       console.error(error)
       return Response.json({ error: 'google_play_sync_failed' }, { status: 502, headers: corsHeaders })
